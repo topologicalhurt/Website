@@ -1,0 +1,53 @@
+diff --git a/node_modules/react-scripts/config/webpack.config.js b/node_modules/react-scripts/config/webpack.config.js
+index e465d8e..53942d5 100644
+--- a/node_modules/react-scripts/config/webpack.config.js
++++ b/node_modules/react-scripts/config/webpack.config.js
+@@ -8,6 +8,7 @@
+ // @remove-on-eject-end
+ 'use strict';
+ 
++const NodePolyfillPlugin = require('node-polyfill-webpack-plugin')
+ const fs = require('fs');
+ const path = require('path');
+ const webpack = require('webpack');
+@@ -303,6 +304,17 @@ module.exports = function (webpackEnv) {
+       ],
+     },
+     resolve: {
++
++      // Fallback to resolving these specific browserify dependencies
++      fallback: {
++        // @ Patch for webpack < 5 not including polyfills for node.js core modules 
++        // by default
++        crypto: require.resolve('crypto-browserify'),
++        path: require.resolve('path-browserify'),
++        os: require.resolve('os-browserify'),
++        stream: require.resolve('stream-browserify')
++      },
++
+       // This allows you to set a fallback for where webpack should look for modules.
+       // We placed these paths second because we want `node_modules` to "win"
+       // if there are any conflicts. This matches Node resolution mechanism.
+@@ -331,6 +343,8 @@ module.exports = function (webpackEnv) {
+         ...(modules.webpackAliases || {}),
+       },
+       plugins: [
++        // new NodePolyfillPlugin(),
++
+         // Prevents users from importing files from outside of src/ (or node_modules/).
+         // This often causes confusion because we only process files within src/ with babel.
+         // To fix this, we prevent you from importing files out of src/ -- if you'd like to,
+@@ -650,7 +664,12 @@ module.exports = function (webpackEnv) {
+       // It is absolutely essential that NODE_ENV is set to production
+       // during a production build.
+       // Otherwise React will be compiled in the very slow development mode.
+-      new webpack.DefinePlugin(env.stringified),
++
++      //@Patch add the NODE_ENV environment variable
++      new webpack.DefinePlugin({
++        'process.env.stringified': JSON.stringify(env.stringified),
++        'process.env.NODE_ENV': JSON.stringify(isEnvDevelopment)
++      }),
+       // Experimental hot reloading for React .
+       // https://github.com/facebook/react/tree/main/packages/react-refresh
+       isEnvDevelopment &&
