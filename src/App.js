@@ -20,7 +20,7 @@ class BoxScene extends Component {
     super();
   }
 
-  #Box = () => {
+  Box = () => {
     return (
         <mesh>
           <boxGeometry args={this.props.size}/>
@@ -30,15 +30,25 @@ class BoxScene extends Component {
   }
 
   @debug
+  scene() {
+    return (
+      <scene>
+        <OrbitControls />
+        <Stars />
+        <group>
+          {this.Box()}
+        </group>
+        <ambientLight intensity={0.5} />
+        <spotLight position={[10, 15, 10]} angle={0.3} />
+      </scene>
+    );
+  }
+
   render() {
     return (
       <Canvas>
-        <OrbitControls />
-        <Stars />
-        <ambientLight intensity={0.5} />
-        <spotLight position={[10, 15, 10]} angle={0.3} />
         <group>
-          {this.#Box()}
+          {this.scene()}
         </group>
       </Canvas>
     );
