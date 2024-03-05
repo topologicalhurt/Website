@@ -353,6 +353,11 @@ module.exports = function (webpackEnv) {
     module: {
       strictExportPresence: true,
       rules: [
+        // Use raw-loader on glsl imports for real-time builds 
+        // {
+        //   test: /\.glsl/i,
+        //   use: 'raw-loader',
+        // },
         // Handle node_modules packages that contain sourcemaps
         shouldUseSourceMap && {
           enforce: 'pre',

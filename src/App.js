@@ -1,67 +1,83 @@
-import React, { Component } from 'react';
-import { Canvas, render } from '@react-three/fiber'
-import { extendTheme, ChakraProvider } from '@chakra-ui/react'
-import { OrbitControls, Stars } from '@react-three/drei'
-import { debug } from './util/dbgUtil'
+import { render, Canvas, useFrame, useThree } from '@react-three/fiber'
+import { useRef, useMemo, useEffect, useState } from 'react'
+import * as THREE from 'three'
+import { FRAG_SHADER_RAYMARCHED_CUBE, SUN_WORSHIP_FRAG_SHADER, VERTEX_SHADER } from './consts'
+import { BoxScene} from './BoxScene'
+import { OrbitControls, useAspect } from '@react-three/drei'
+import axios from "axios";
 
-const colors = {
-  brand: {
-    900: '#1a365d',
-    800: '#153e75',
-    700: '#2a69ac',
-  },
-}
 
-const theme = extendTheme({colors})
+const Scene = ({ vertex, fragment }) => {
+  // For responsive images
+  const sz = useAspect(1920, 1080);
 
-class BoxScene extends Component {
+  // const viewport = useThree(state => state.viewport)
+  // const width = viewport.width;
+  // const height = viewport.height;
 
-  constructor() {
-    super();
-  }
+  const mesh = useRef();
+  useFrame((state) => {
+    let time = state.clock.getElapsedTime();
+    mesh.current.material.uniforms.iTime.value = time;
+  });
+  const uniforms = useMemo(
+    () => ({
+      iTime: {
+        type: "f",
+        value: 1.0,
+      },
+      iResolution: {
+        type: "v2",
+        value: new THREE.Vector2(4, 3),
+      },
+    }),
+    []
+  );
 
-  Box = () => {
-    return (
-        <mesh>
-          <boxGeometry args={this.props.size}/>
-          <meshBasicMaterial color={this.props.color}/>
-        </mesh>
-    );
-  }
+  return (
+    // </mesh><mesh ref={mesh} scale={[width, height, 1]}>
 
-  @debug
-  scene() {
-    return (
-      <scene>
-        <OrbitControls />
-        <Stars />
-        <group>
-          {this.Box()}
-        </group>
-        <ambientLight intensity={0.5} />
-        <spotLight position={[10, 15, 10]} angle={0.3} />
-      </scene>
-    );
-  }
-
-  render() {
-    return (
-      <Canvas>
-        <group>
-          {this.scene()}
-        </group>
-      </Canvas>
-    );
-  }
+    <mesh ref={mesh} scale={sz}>
+    <planeGeometry/>
+      <shaderMaterial
+        uniforms={uniforms}
+        fragmentShader={fragment}
+        vertexShader={vertex}
+        side={THREE.DoubleSide}
+      />
+    </mesh>
+  );
 }
 
 const App = () => {
+
+
+  const [vertex, setVertex] = useState("");
+  const [fragment, setFragment] = useState("");
+
+  // Fetch the shaders once the component mounts
+  useEffect(() => {
+    // fetch the vertex and fragment shaders from public folder 
+    axios.get(VERTEX_SHADER).then((res) => setVertex(res.data));
+    axios.get(SUN_WORSHIP_FRAG_SHADER).then((res) => setFragment(res.data));
+  }, []);
+
+  // If the shaders are not loaded yet, return null (nothing will be rendered)
+  if (vertex === "" || fragment === "") return null;
+
   return (
-  <ChakraProvider theme={theme}>
-    <div id="canvas-container">
-      <BoxScene size={[1,1,1]} color={0x00ffff}/>
-    </div>
-  </ChakraProvider>
+    // Render's box scene if in debug mode
+    // <Canvas>
+    //   <BoxScene color={0x000000} size={[2,2,2]}/>
+    // </Canvas>
+
+    // Blank canvas scene
+    // <Canvas style={{ width: "100vw", height: "100vh" }} /
+
+    // Shadertoy
+    <Canvas style={{ width: "100vw", height: "100vh" }}>
+      <Scene vertex={vertex} fragment={fragment} />
+    </Canvas>
   );
 }
 
