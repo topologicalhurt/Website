@@ -1,9 +1,10 @@
-import { render, Canvas, useFrame, useThree } from '@react-three/fiber'
+import { render, Canvas, useFrame,  useThree } from '@react-three/fiber'
 import { useRef, useMemo, useEffect, useState } from 'react'
 import * as THREE from 'three'
-import { FRAG_SHADER_RAYMARCHED_CUBE, SUN_WORSHIP_FRAG_SHADER, VERTEX_SHADER } from './consts'
+import { FRAG_SHADER_RAYMARCHED_CUBE, 
+  SUN_WORSHIP_FRAG_SHADER, VERTEX_SHADER, SUN_WORSHIP_MAYAN_CALENDER_TEXT } from './consts'
 import { BoxScene} from './BoxScene'
-import { OrbitControls, useAspect } from '@react-three/drei'
+import { OrbitControls, useAspect, useTexture } from '@react-three/drei'
 import axios from "axios";
 
 
@@ -14,6 +15,8 @@ const Scene = ({ vertex, fragment }) => {
   // const viewport = useThree(state => state.viewport)
   // const width = viewport.width;
   // const height = viewport.height;
+
+  const texture = useTexture(SUN_WORSHIP_MAYAN_CALENDER_TEXT);
 
   const mesh = useRef();
   useFrame((state) => {
@@ -29,6 +32,10 @@ const Scene = ({ vertex, fragment }) => {
       iResolution: {
         type: "v2",
         value: new THREE.Vector2(4, 3),
+      },
+      iChannel0: {
+        type: "t",
+        value: texture,
       },
     }),
     []
@@ -78,6 +85,14 @@ const App = () => {
     <Canvas style={{ width: "100vw", height: "100vh" }}>
       <Scene vertex={vertex} fragment={fragment} />
     </Canvas>
+  );
+}
+
+const Text = () => {
+  return ( 
+    <div>
+      Hi 
+    </div>
   );
 }
 
