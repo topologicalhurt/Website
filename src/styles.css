@@ -1,0 +1,28 @@
+@import url('https://fonts.googleapis.com/css2?family=Inconsolata:wght@200..900&display=swap');
+
+.banner {
+    position: fixed;
+    flex-grow: 1;
+    flex-basis: 0;
+    flex-shrink: 0;
+    flex-direction: row;
+    display: flex;
+    top: -50vh;
+    left: -50vw;
+    width: 100vw;
+    height: 50px;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    z-index: 1;
+  }
+  
+.banner h2 {
+    margin: 20px;
+    display: inline-block;
+    font-size: 20px;
+    font-family: 'Incnsolata', monospace;
+    text-align: center;
+    white-space: nowrap;
+    z-index: 2;
+  }

@@ -1,11 +1,14 @@
 import { render, Canvas, useFrame,  useThree } from '@react-three/fiber'
-import { useRef, useMemo, useEffect, useState } from 'react'
+import { useRef, useMemo, useEffect, useState, Children } from 'react'
 import * as THREE from 'three'
 import { FRAG_SHADER_RAYMARCHED_CUBE, 
-  SUN_WORSHIP_FRAG_SHADER, VERTEX_SHADER, SUN_WORSHIP_MAYAN_CALENDER_TEXT } from './consts'
+  SUN_WORSHIP_FRAG_SHADER, VERTEX_SHADER, SUN_WORSHIP_MAYAN_CALENDER_TEXT, DEBUG_MSG } from './consts'
 import { BoxScene} from './BoxScene'
-import { OrbitControls, useAspect, useTexture } from '@react-three/drei'
+import { OrbitControls, useAspect, useTexture, Html } from '@react-three/drei'
 import axios from "axios";
+import { DebugMsg } from './util/dbgMsg'
+import './styles.css';
+import { TextOverlay } from './util/textOverlay'
 
 
 const Scene = ({ vertex, fragment }) => {
@@ -56,6 +59,7 @@ const Scene = ({ vertex, fragment }) => {
   );
 }
 
+
 const App = () => {
 
 
@@ -72,6 +76,37 @@ const App = () => {
   // If the shaders are not loaded yet, return null (nothing will be rendered)
   if (vertex === "" || fragment === "") return null;
 
+  const styleFunction = (nChildren, index) => {
+    return { "backgroundColor": `hsl(${((200 + index) % 220)}deg, ${index * 10}%, 50%)`};
+  }
+
+  const Banner = (props) => {
+    const childLength = props.children.length;
+    return (
+      <Html> 
+        <div className="banner">
+          {Children.map(props.children, (child, index) => (
+            <div key={index} style={styleFunction(childLength, index)}>
+              {child}
+            </div>
+          ))}
+        </div>
+      </Html>
+    );
+  }
+
+  const Menu = () => {
+    return (
+      <Banner styleFunction={styleFunction}>
+        <h2>Return to tha mothership</h2>
+        <h2>Store</h2>
+        <h2>Poems</h2>
+        <h2>The endless domain of thought</h2>
+        <h2>Magicks</h2>
+      </Banner>
+    );
+  }
+
   return (
     // Render's box scene if in debug mode
     // <Canvas>
@@ -81,18 +116,11 @@ const App = () => {
     // Blank canvas scene
     // <Canvas style={{ width: "100vw", height: "100vh" }} /
 
-    // Shadertoy
+    // Shader
     <Canvas style={{ width: "100vw", height: "100vh" }}>
       <Scene vertex={vertex} fragment={fragment} />
+      <Menu />
     </Canvas>
-  );
-}
-
-const Text = () => {
-  return ( 
-    <div>
-      Hi 
-    </div>
   );
 }
 

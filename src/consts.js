@@ -14,6 +14,8 @@ export const VERTEX_SHADER = "/shaders/default_vertex_shader.glsl";
 
 export const DEBUG = process.env.NODE_ENV
 
+export const DEBUG_MSG = "WARNING! The project is not running in production mode as indicated by process.env.NODE_ENV."
+
 // Warning! This will override the NODE_ENV variable
 // Only use this option if you are 
 // (a) NOT building 
