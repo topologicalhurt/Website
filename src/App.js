@@ -2,7 +2,7 @@ import { render, Canvas, useFrame,  useThree } from '@react-three/fiber'
 import { useRef, useMemo, useEffect, useState, Children } from 'react'
 import * as THREE from 'three'
 import { FRAG_SHADER_RAYMARCHED_CUBE, 
-  SUN_WORSHIP_FRAG_SHADER, VERTEX_SHADER, SUN_WORSHIP_MAYAN_CALENDER_TEXT, DEBUG_MSG } from './consts'
+  SUN_WORSHIP_FRAG_SHADER, VERTEX_SHADER, SUN_WORSHIP_MAYAN_CALENDER_TEXT, MENGER_FLY_THROUGH_SHADER, DEBUG_MSG } from './consts'
 import { BoxScene} from './BoxScene'
 import { OrbitControls, useAspect, useTexture, Html } from '@react-three/drei'
 import axios from "axios";
@@ -10,14 +10,17 @@ import { DebugMsg } from './util/dbgMsg'
 import './styles.css';
 import { TextOverlay } from './util/textOverlay'
 
+// Shader options for the index
+const SHADER_OPTIONS = [
+  { name: 'Sun Worship', path: SUN_WORSHIP_FRAG_SHADER, needsTexture: true },
+  { name: 'Menger Fly Through', path: MENGER_FLY_THROUGH_SHADER, needsTexture: false },
+  { name: 'Raymarched Cube', path: FRAG_SHADER_RAYMARCHED_CUBE, needsTexture: false },
+];
 
-const Scene = ({ vertex, fragment }) => {
-  // For responsive images
-  const sz = useAspect(1920, 1080);
 
-  // const viewport = useThree(state => state.viewport)
-  // const width = viewport.width;
-  // const height = viewport.height;
+const Scene = ({ vertex, fragment, needsTexture }) => {
+  // Use Mac's resolution as reference (16:10 aspect ratio)
+  const sz = useAspect(2560, 1600);
 
   const texture = useTexture(SUN_WORSHIP_MAYAN_CALENDER_TEXT);
 
@@ -27,26 +30,35 @@ const Scene = ({ vertex, fragment }) => {
     mesh.current.material.uniforms.iTime.value = time;
   });
   const uniforms = useMemo(
-    () => ({
-      iTime: {
-        type: "f",
-        value: 1.0,
-      },
-      iResolution: {
-        type: "v2",
-        value: new THREE.Vector2(4, 3),
-      },
-      iChannel0: {
-        type: "t",
-        value: texture,
-      },
-    }),
-    []
+    () => {
+      const baseUniforms = {
+        iTime: {
+          type: "f",
+          value: 1.0,
+        },
+        iResolution: {
+          type: "v2",
+          // Use 16:10 ratio to match Mac (same ratio as 2560:1600)
+          value: new THREE.Vector2(16, 10),
+        },
+        iRandomSeed: {
+          type: "f",
+          // Random seed generated fresh each page load
+          value: Math.random() * 10000.0,
+        },
+      };
+      if (needsTexture) {
+        baseUniforms.iChannel0 = {
+          type: "t",
+          value: texture,
+        };
+      }
+      return baseUniforms;
+    },
+    [needsTexture, texture]
   );
 
   return (
-    // </mesh><mesh ref={mesh} scale={[width, height, 1]}>
-
     <mesh ref={mesh} scale={sz}>
     <planeGeometry/>
       <shaderMaterial
@@ -62,22 +74,45 @@ const Scene = ({ vertex, fragment }) => {
 
 const App = () => {
 
-
   const [vertex, setVertex] = useState("");
   const [fragment, setFragment] = useState("");
+  const [shaderIndex, setShaderIndex] = useState(0);
+  const currentShader = SHADER_OPTIONS[shaderIndex];
 
-  // Fetch the shaders once the component mounts
+  // Fetch the shaders once the component mounts or when shader changes
   useEffect(() => {
     // fetch the vertex and fragment shaders from public folder 
     axios.get(VERTEX_SHADER).then((res) => setVertex(res.data));
-    axios.get(SUN_WORSHIP_FRAG_SHADER).then((res) => setFragment(res.data));
-  }, []);
+    axios.get(currentShader.path).then((res) => setFragment(res.data));
+  }, [currentShader.path]);
 
   // If the shaders are not loaded yet, return null (nothing will be rendered)
   if (vertex === "" || fragment === "") return null;
 
   const styleFunction = (nChildren, index) => {
     return { "backgroundColor": `hsl(${((200 + index) % 220)}deg, ${index * 10}%, 50%)`};
+  }
+
+  const ShaderSelector = () => {
+    return (
+      <div className="shader-selector">
+        <h3>Shader Index</h3>
+        <ul>
+          {SHADER_OPTIONS.map((shader, index) => (
+            <li 
+              key={index} 
+              className={index === shaderIndex ? 'active' : ''}
+              onClick={() => {
+                setFragment(""); // Reset to trigger loading state
+                setShaderIndex(index);
+              }}
+            >
+              {shader.name}
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
   }
 
   const Banner = (props) => {
@@ -117,10 +152,13 @@ const App = () => {
     // <Canvas style={{ width: "100vw", height: "100vh" }} /
 
     // Shader
+    <>
     <Canvas style={{ width: "100vw", height: "100vh" }}>
-      <Scene vertex={vertex} fragment={fragment} />
+      <Scene vertex={vertex} fragment={fragment} needsTexture={currentShader.needsTexture} />
       <Menu />
     </Canvas>
+    <ShaderSelector />
+    </>
   );
 }
 

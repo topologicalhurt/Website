@@ -10,6 +10,8 @@ export const FRAG_SHADER_RAYMARCHED_CUBE = "/shaders/ray_marched_cube_test_fshad
 export const SUN_WORSHIP_FRAG_SHADER = "/shaders/sun_worship_frag_shader.glsl";
 export const SUN_WORSHIP_MAYAN_CALENDER_TEXT = "/shaders/aztec_calender_text.webp";
 
+export const MENGER_FLY_THROUGH_SHADER = "/shaders/menger_fly_through.glsl";
+
 export const VERTEX_SHADER = "/shaders/default_vertex_shader.glsl";
 
 export const DEBUG = process.env.NODE_ENV

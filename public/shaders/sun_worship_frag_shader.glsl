@@ -1,5 +1,9 @@
+#ifdef GL_ES
+precision highp float;
+#endif
+
 #define PI 3.14159265359
-#define RES_SCALE 1.05
+#define RES_SCALE 1.0
 #define N_PASSES 12.
 #define TIME_COEFF 10.
 
@@ -54,12 +58,12 @@ void drawSun() {
 
     // Mask out centre ring for a texture
     if ((uv0Length >= .7 || uv0Length <= .35 || (c.x + c.y + c.z) >= .65)) {
-        gl_FragColor += vec4(c, 1.);
+        gl_FragColor = vec4(c, 1.);
     } else {
         vec2 imgCoords = (vUv * iResolution * 0.5) - vec2(1., 0.75);
         vec2 rotText = rot * (imgCoords) + vec2(0.5, 0.5);
-        gl_FragColor += vec4(c - (smoothstep(0., .65, length(imgCoords)))
-         + mix(texture(iChannel0, rotText).xyz, vec3(.25, .1, 0.), .5), 1.);
+        gl_FragColor = vec4(c - (smoothstep(0., .65, length(imgCoords)))
+         + mix(texture2D(iChannel0, rotText).xyz, vec3(.25, .1, 0.), .5), 1.);
     }
 }
 
