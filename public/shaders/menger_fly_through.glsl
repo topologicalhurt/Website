@@ -5,12 +5,237 @@ precision highp float;
 uniform float iTime;
 uniform vec2 iResolution;
 uniform float iRandomSeed;  // Random seed from JavaScript, changes each page load
+uniform float iConsoleMode;  // 1.0 = console mode, 0.0 = normal mode
+uniform sampler2D iTextBuffer;  // Text buffer texture (128x4 = 512 chars max)
 varying vec2 vUv;
 
 #define PI 3.14159265359
 
+// ============================================================================
+// BLACK HOLE CONSTANTS - Must be declared before any functions use them
+// ============================================================================
+const float BLACK_HOLE_MASS = 1.0;        // Controls lensing strength (stronger)
+const float EVENT_HORIZON = 0.02;          // Schwarzschild radius (larger)
+const float ACCRETION_INNER = 0.03;        // Inner edge of accretion disk
+const float ACCRETION_OUTER = 0.05;         // Outer edge of accretion disk
+const vec3 BLACK_HOLE_POS = vec3(0.0);     // Center of the Menger cube - FIXED
+
 // Session random seed - computed in main() and passed to functions
 float sessionSeed;
+
+// Global flag for camera inside cube - set in main(), used in map()
+bool gCameraInsideCube = false;
+
+// ============================================================================
+// CONSOLE RENDERING - Terminal overlay when tilda is pressed
+// ============================================================================
+
+// Simple 5x7 bitmap font - returns 1.0 if pixel is set for character
+float getChar(int charCode, vec2 p)
+{
+    // p is 0-1 within the character cell
+    if(p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 0.0;
+    
+    int px = int(p.x * 5.0);
+    int py = int((1.0 - p.y) * 7.0);  // Flip Y
+    
+    // Simple bitmap patterns for basic ASCII
+    // Each character is 5 wide x 7 tall
+    int pattern = 0;
+    
+    // Space
+    if(charCode == 32) return 0.0;
+    
+    // Numbers 0-9 (ASCII 48-57)
+    if(charCode == 48) { // 0
+        if(py == 0 || py == 6) pattern = (px >= 1 && px <= 3) ? 1 : 0;
+        else if(px == 0 || px == 4) pattern = 1;
+        else pattern = 0;
+    }
+    else if(charCode == 49) { // 1
+        if(px == 2) pattern = 1;
+        else if(py == 6 && px >= 1 && px <= 3) pattern = 1;
+        else if(py == 1 && px == 1) pattern = 1;
+        else pattern = 0;
+    }
+    else if(charCode >= 50 && charCode <= 57) { // 2-9 simplified
+        if(py == 0 || py == 3 || py == 6) pattern = 1;
+        else if(py < 3 && px == 4) pattern = 1;
+        else if(py > 3 && px == 0) pattern = 1;
+        else pattern = 0;
+    }
+    
+    // Letters A-Z (ASCII 65-90) and a-z (97-122)
+    int letter = charCode;
+    if(charCode >= 97) letter = charCode - 32; // lowercase to uppercase
+    
+    if(letter >= 65 && letter <= 90) {
+        int idx = letter - 65;
+        // Generic letter pattern - vertical bars with horizontal connections
+        if(px == 0 || px == 4) pattern = 1;
+        else if(py == 0 && idx != 20) pattern = (px >= 1 && px <= 3) ? 1 : 0; // Top bar (not U)
+        else if(py == 3 && (idx == 0 || idx == 1 || idx == 4 || idx == 5 || idx == 7 || idx == 15 || idx == 17)) pattern = 1; // Middle bar for A,B,E,F,H,P,R
+        else if(py == 6) pattern = (px >= 1 && px <= 3) ? 1 : 0; // Bottom bar
+        else pattern = 0;
+    }
+    
+    // Special characters
+    if(charCode == 62) { // >
+        if(py == 3) pattern = 1;
+        else if(py == 1 && px == 2) pattern = 1;
+        else if(py == 2 && px == 3) pattern = 1;
+        else if(py == 4 && px == 3) pattern = 1;
+        else if(py == 5 && px == 2) pattern = 1;
+        else pattern = 0;
+    }
+    if(charCode == 95) { // _ (underscore/cursor)
+        pattern = (py == 6) ? 1 : 0;
+    }
+    if(charCode == 124) { // | (pipe/cursor)
+        pattern = (px == 2) ? 1 : 0;
+    }
+    if(charCode == 46) { // . (period)
+        pattern = (py >= 5 && px == 2) ? 1 : 0;
+    }
+    if(charCode == 47) { // / (slash)
+        pattern = (px == (6 - py) / 2) ? 1 : 0;
+    }
+    if(charCode == 45) { // - (dash)
+        pattern = (py == 3 && px >= 1 && px <= 3) ? 1 : 0;
+    }
+    if(charCode == 58) { // : (colon)
+        pattern = (px == 2 && (py == 2 || py == 5)) ? 1 : 0;
+    }
+    
+    return float(pattern);
+}
+
+// Render console/terminal background
+vec3 renderConsole(vec2 uv, float time)
+{
+    // Console colors
+    vec3 bgColor = vec3(0.02, 0.02, 0.04);       // Dark blue-black
+    vec3 textColor = vec3(0.2, 1.0, 0.3);        // Bright green terminal text
+    vec3 cursorColor = vec3(0.4, 1.0, 0.5);      // Bright green cursor
+    vec3 promptColor = vec3(0.3, 0.5, 1.0);      // Blue prompt
+    
+    vec3 color = bgColor;
+    
+    // CRT curvature
+    vec2 crtUV = uv;
+    vec2 centered = crtUV - 0.5;
+    crtUV += centered * dot(centered, centered) * 0.1;
+    
+    // Scanline effect
+    float scanline = 0.95 + 0.05 * sin(crtUV.y * iResolution.y * 2.0);
+    
+    // Character grid settings
+    float charW = 12.0;  // Character width in pixels
+    float charH = 20.0;  // Character height in pixels
+    float marginX = 40.0;
+    float marginY = 40.0;
+    
+    // Convert to pixel coordinates
+    vec2 pixelCoord = crtUV * iResolution.xy;
+    
+    // Check if we're in the text area
+    if(pixelCoord.x > marginX && pixelCoord.x < iResolution.x - marginX &&
+       pixelCoord.y > marginY && pixelCoord.y < iResolution.y - marginY) {
+        
+        // Adjust for margin
+        vec2 textPixel = pixelCoord - vec2(marginX, marginY);
+        
+        // Which character cell are we in?
+        float col = floor(textPixel.x / charW);
+        float row = floor((iResolution.y - 2.0 * marginY - textPixel.y) / charH);  // Flip Y, top row = 0
+        
+        // Position within character cell (0-1)
+        vec2 cellPos = vec2(
+            mod(textPixel.x, charW) / charW,
+            mod(textPixel.y, charH) / charH
+        );
+        
+        // Read character from texture buffer
+        // Row 0 is the input line, stored in first row of texture
+        if(row >= 0.0 && row < 8.0 && col >= 0.0 && col < 120.0) {
+            float texX = (col + 0.5) / 128.0;
+            float texY = (row + 0.5) / 8.0;
+            
+            vec4 charData = texture2D(iTextBuffer, vec2(texX, texY));
+            float charCodeF = charData.r * 255.0;
+            
+            if(charCodeF > 31.0) {  // Printable character
+                // Simple character rendering - make a block for any printable char
+                float inChar = 0.0;
+                
+                // Leave small gaps between characters
+                if(cellPos.x > 0.1 && cellPos.x < 0.85 && cellPos.y > 0.15 && cellPos.y < 0.85) {
+                    // For letters/numbers, render a simple pattern
+                    int charCode = int(charCodeF + 0.5);
+                    
+                    // Simple 5x7 grid representation
+                    float gx = (cellPos.x - 0.1) / 0.75;  // 0-1 in char area
+                    float gy = (cellPos.y - 0.15) / 0.7;
+                    int px = int(gx * 5.0);
+                    int py = int((1.0 - gy) * 7.0);
+                    
+                    // Space - empty
+                    if(charCode == 32) {
+                        inChar = 0.0;
+                    }
+                    // > prompt character
+                    else if(charCode == 62) {
+                        if((py == 1 || py == 5) && px == 1) inChar = 1.0;
+                        else if((py == 2 || py == 4) && px == 2) inChar = 1.0;
+                        else if(py == 3 && px == 3) inChar = 1.0;
+                    }
+                    // Generic character - render vertical bars
+                    else {
+                        // Make letters look like simple block characters
+                        if(px == 0 || px == 4) inChar = 1.0;  // Side bars
+                        else if(py == 0 || py == 6) inChar = 1.0;  // Top/bottom
+                        else if(py == 3 && charCode != 73 && charCode != 105) inChar = 0.5;  // Middle bar (not for I/i)
+                    }
+                }
+                
+                // Color based on position (prompt vs text)
+                if(col < 2.0) {
+                    color = mix(color, promptColor, inChar);
+                } else {
+                    color = mix(color, textColor, inChar);
+                }
+            }
+        }
+        
+        // Blinking cursor
+        float cursorBlink = step(0.5, fract(time * 1.5));
+        // Get cursor position from texture (stored at position 0 of row 7)
+        vec4 cursorData = texture2D(iTextBuffer, vec2(0.5/128.0, 7.5/8.0));
+        float cursorCol = cursorData.r * 255.0;
+        
+        if(row == 0.0 && abs(col - cursorCol) < 0.5 && cursorBlink > 0.5) {
+            // Draw cursor block
+            if(cellPos.x > 0.1 && cellPos.x < 0.9 && cellPos.y > 0.1 && cellPos.y < 0.9) {
+                color = cursorColor;
+            }
+        }
+    }
+    
+    // Apply scanlines
+    color *= scanline;
+    
+    // Vignette
+    float vignette = 1.0 - dot(centered, centered) * 1.5;
+    color *= max(vignette, 0.3);
+    
+    // Screen flicker
+    color *= 0.97 + 0.03 * sin(time * 50.0);
+    
+    // Phosphor glow
+    color += bgColor * 0.3;
+    
+    return color;
+}
 
 float maxcomp(in vec3 p) { return max(p.x, max(p.y, p.z)); }
 
@@ -21,12 +246,41 @@ float sdfBox(vec3 p, vec3 b)
     return min(mc, length(max(di, 0.0)));
 }
 
+// Apply space distortion from black hole to a point (optimized)
+vec3 distortSpaceAroundBlackHole(vec3 p)
+{
+    vec3 toHole = p - BLACK_HOLE_POS;
+    float dist = length(toHole);
+    
+    if(dist < EVENT_HORIZON || dist > 2.5) return p;  // Early exit for far points
+    
+    float distortStrength = BLACK_HOLE_MASS / (dist * dist + 0.01);
+    distortStrength = min(distortStrength, 0.8);
+    
+    vec3 pullDir = -normalize(toHole);
+    float angle = distortStrength * 2.0 / (dist + 0.1);
+    
+    return p + pullDir * distortStrength * 0.15 + 
+           vec3(toHole.y * sin(angle), toHole.z * sin(angle), toHole.x * sin(angle)) * distortStrength * 0.2;
+}
+
 vec3 map(in vec3 p)
 {
-    float d = sdfBox(p, vec3(1.0));
+    // NO black hole distortion on cube geometry - keeps it clean
+    
+    // Carve out sphere for black hole in center - nothing exists inside event horizon
+    float blackHoleDist = length(p - BLACK_HOLE_POS);
+    if(blackHoleDist < EVENT_HORIZON * 1.1) {
+        return vec3(blackHoleDist - EVENT_HORIZON, 1.0, 1.0); // Empty space inside
+    }
+    
+    float d = sdfBox(p, vec3(2.0));
 
     float s = 1.0;
-    int n_iters = int(20.0 * abs(2.0 * fract(iTime / 5.0) - 1.0) + 5.0);
+
+    // Use constant 10 iterations when camera is inside cube (better detail, less clipping)
+    // Otherwise vary iterations for visual effect when viewing from outside
+    int n_iters = gCameraInsideCube ? 10 : int(mix(4.0, 8.0, abs(2.0 * fract(iTime / 5.0) - 1.0)));
     for(int m = 0; m < 10; m++)
     {
         if(m >= n_iters) break;
@@ -47,10 +301,14 @@ vec3 map(in vec3 p)
 
 vec3 intersect(in vec3 ro, in vec3 rd)
 {
-    for(float t = 0.0; t < 10.0;)
+    // Tighter threshold when inside cube to reduce clipping
+    float hitThreshold = gCameraInsideCube ? 0.0005 : 0.002;
+    float maxDist = gCameraInsideCube ? 20.0 : 15.0;
+    
+    for(float t = 0.0; t < maxDist;)
     {
         vec3 h = map(ro + rd * t);
-        if(h.x < 0.001)
+        if(h.x < hitThreshold)
             return vec3(t, h.yz);
         t += h.x;
     }
@@ -68,33 +326,33 @@ vec3 calcNormal(in vec3 pos)
     ));
 }
 
-// Soft shadows for depth
+// Soft shadows for depth (optimized: 16 iterations)
 float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k)
 {
     float res = 1.0;
     float t = mint;
-    for(int i = 0; i < 32; i++)
+    for(int i = 0; i < 16; i++)
     {
         if(t >= maxt) break;
         float h = map(ro + rd * t).x;
         if(h < 0.001) return 0.0;
         res = min(res, k * h / t);
-        t += h;
+        t += h * 1.5;  // Larger steps
     }
     return res;
 }
 
-// Ambient occlusion
+// Ambient occlusion (optimized: 3 iterations)
 float calcAO(vec3 pos, vec3 nor)
 {
     float occ = 0.0;
     float sca = 1.0;
-    for(int i = 0; i < 5; i++)
+    for(int i = 0; i < 3; i++)
     {
-        float h = 0.01 + 0.12 * float(i) / 4.0;
+        float h = 0.01 + 0.15 * float(i) / 2.0;
         float d = map(pos + h * nor).x;
         occ += (h - d) * sca;
-        sca *= 0.95;
+        sca *= 0.9;
     }
     return clamp(1.0 - 3.0 * occ, 0.0, 1.0);
 }
@@ -133,753 +391,367 @@ float noise3D(vec3 p)
             mix(hash(i + vec3(0, 1, 1)), hash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
 }
 
-// Fractal Brownian Motion - optimized 3 iterations
+// Fractal Brownian Motion - optimized 2 iterations
 float fbm(vec3 p)
 {
-    float value = 0.5 * noise3D(p);
-    p *= 2.0;
-    value += 0.25 * noise3D(p);
-    p *= 2.0;
-    value += 0.125 * noise3D(p);
-    return value;
+    return 0.5 * noise3D(p) + 0.25 * noise3D(p * 2.0);
 }
 
 // Rotation matrix around arbitrary axis
 mat2 rot2D(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
 
-// Vibrant expanded color palette - purples, magentas, varied blues and reds
-vec3 hubbleColor(float seed)
+// ============================================================================
+// BLACK HOLE - Gravitational lensing at center of Menger cube
+// ============================================================================
+
+// Bend ray direction due to gravitational lensing
+// Uses simplified Schwarzschild metric approximation
+vec3 gravitationalLensing(vec3 rayPos, vec3 rayDir, float mass)
 {
-    float idx = hash(seed) * 30.0;
+    vec3 toHole = BLACK_HOLE_POS - rayPos;
+    float dist = length(toHole);
     
-    // PURPLES & MAGENTAS
-    if(idx < 1.0) return vec3(0.7, 0.2, 0.9);       // Vivid purple
-    if(idx < 2.0) return vec3(0.5, 0.1, 0.7);       // Deep violet
-    if(idx < 3.0) return vec3(0.9, 0.3, 0.8);       // Hot magenta
-    if(idx < 4.0) return vec3(0.6, 0.3, 0.9);       // Blue-violet
-    if(idx < 5.0) return vec3(0.8, 0.1, 0.6);       // Magenta-pink
-    if(idx < 6.0) return vec3(0.4, 0.2, 0.6);       // Dark purple
+    // Skip if too far for noticeable effect
+    if(dist > 3.0) return rayDir;
     
-    // BLUES - varied intensities
-    if(idx < 7.0) return vec3(0.2, 0.4, 1.0);       // Bright blue
-    if(idx < 8.0) return vec3(0.1, 0.3, 0.9);       // Deep blue
-    if(idx < 9.0) return vec3(0.4, 0.7, 1.0);       // Sky blue
-    if(idx < 10.0) return vec3(0.3, 0.5, 0.95);     // Royal blue
-    if(idx < 11.0) return vec3(0.5, 0.8, 1.0);      // Light cyan-blue
-    if(idx < 12.0) return vec3(0.2, 0.6, 0.9);      // Azure
+    vec3 toHoleNorm = toHole / dist;
     
-    // REDS & PINKS - varied intensities  
-    if(idx < 13.0) return vec3(1.0, 0.2, 0.3);      // Bright red
-    if(idx < 14.0) return vec3(0.9, 0.1, 0.2);      // Deep crimson
-    if(idx < 15.0) return vec3(1.0, 0.4, 0.5);      // Coral pink
-    if(idx < 16.0) return vec3(1.0, 0.3, 0.6);      // Hot pink
-    if(idx < 17.0) return vec3(0.8, 0.2, 0.4);      // Rose red
-    if(idx < 18.0) return vec3(1.0, 0.5, 0.6);      // Salmon pink
+    // Deflection angle based on Einstein's formula (simplified)
+    // Real formula: alpha = 4GM/(c^2 * b) where b is impact parameter
+    float impactParam = length(cross(rayDir, toHole));
     
-    // ORANGES & YELLOWS
-    if(idx < 19.0) return vec3(1.0, 0.5, 0.2);      // Bright orange
-    if(idx < 20.0) return vec3(1.0, 0.7, 0.3);      // Gold
-    if(idx < 21.0) return vec3(1.0, 0.85, 0.5);     // Yellow
-    if(idx < 22.0) return vec3(0.95, 0.6, 0.3);     // Amber
+    // Avoid division by zero and extreme bending very close
+    impactParam = max(impactParam, EVENT_HORIZON * 0.5);
     
-    // CYANS & TEALS
-    if(idx < 23.0) return vec3(0.2, 0.9, 0.9);      // Bright cyan
-    if(idx < 24.0) return vec3(0.3, 0.8, 0.7);      // Teal
-    if(idx < 25.0) return vec3(0.4, 1.0, 0.9);      // Aqua
+    // Deflection strength - stronger closer to black hole
+    float deflection = mass / (impactParam * impactParam) * 0.5;
+    deflection = min(deflection, 1.5); // Cap maximum bend
     
-    // MIXED/SPECIAL
-    if(idx < 26.0) return vec3(0.9, 0.7, 1.0);      // Lavender
-    if(idx < 27.0) return vec3(1.0, 0.6, 0.8);      // Pink-salmon
-    if(idx < 28.0) return vec3(0.6, 0.9, 0.6);      // Pale green
-    if(idx < 29.0) return vec3(0.9, 0.4, 0.9);      // Orchid
+    // Calculate perpendicular direction toward black hole
+    vec3 perpDir = toHoleNorm - rayDir * dot(rayDir, toHoleNorm);
+    float perpLen = length(perpDir);
+    if(perpLen > 0.001) {
+        perpDir /= perpLen;
+        // Bend ray toward black hole
+        rayDir = normalize(rayDir + perpDir * deflection);
+    }
     
-    return vec3(0.8, 0.5, 1.0);                      // Violet-pink
+    return rayDir;
 }
 
-// Turbulent FBM for complex gas structures
+// Check if ray hits event horizon (proper ray-sphere intersection)
+bool hitsEventHorizon(vec3 rayPos, vec3 rayDir)
+{
+    vec3 oc = rayPos - BLACK_HOLE_POS;
+    float a = dot(rayDir, rayDir);
+    float b = 2.0 * dot(oc, rayDir);
+    float c = dot(oc, oc) - EVENT_HORIZON * EVENT_HORIZON;
+    float discriminant = b * b - 4.0 * a * c;
+    
+    if(discriminant < 0.0) return false;
+    
+    // Check if intersection is in front of ray
+    float t = (-b - sqrt(discriminant)) / (2.0 * a);
+    return t > 0.0;
+}
+
+// Render accretion disk - swirling hot matter around black hole
+vec3 renderAccretionDisk(vec3 rayPos, vec3 rayDir, float time)
+{
+    vec3 color = vec3(0.0);
+    
+    // Disk lies in XZ plane at y=0 (roughly)
+    // But tilted slightly for visual interest
+    float tiltAngle = 0.3 + sin(time * 0.1) * 0.1;
+    vec3 diskNormal = normalize(vec3(sin(tiltAngle) * 0.3, 1.0, cos(tiltAngle) * 0.2));
+    
+    // Find intersection with disk plane
+    float denom = dot(rayDir, diskNormal);
+    if(abs(denom) < 0.001) return color;
+    
+    float t = dot(BLACK_HOLE_POS - rayPos, diskNormal) / denom;
+    if(t < 0.0) return color;
+    
+    vec3 hitPoint = rayPos + rayDir * t;
+    vec3 toCenter = hitPoint - BLACK_HOLE_POS;
+    float r = length(toCenter);
+    
+    // Only render within disk bounds
+    if(r < ACCRETION_INNER || r > ACCRETION_OUTER) return color;
+    
+    // Angle around disk
+    float angle = atan(toCenter.z, toCenter.x);
+    
+    // Swirling motion - inner parts orbit faster (Keplerian)
+    float orbitSpeed = 1.0 / pow(r, 1.5);
+    float swirl = angle + time * orbitSpeed * 2.0;
+    
+    // Spiral arm structure
+    float arms = sin(swirl * 3.0 - r * 20.0) * 0.5 + 0.5;
+    arms = pow(arms, 0.7);
+    
+    // Turbulent detail
+    float turb = noise3D(vec3(toCenter.xz * 15.0 + time * 0.5, time * 0.2));
+    
+    // Temperature gradient - hotter (bluer/whiter) toward center
+    float temp = smoothstep(ACCRETION_OUTER, ACCRETION_INNER, r);
+    
+    // Base disk brightness - brighter in the middle
+    float brightness = smoothstep(ACCRETION_OUTER, ACCRETION_INNER * 1.5, r);
+    brightness *= smoothstep(ACCRETION_INNER * 0.9, ACCRETION_INNER * 1.3, r);
+    brightness *= (0.5 + arms * 0.5) * (0.7 + turb * 0.3);
+    
+    // Doppler beaming - approaching side brighter
+    float doppler = 1.0 + sin(angle + time * orbitSpeed) * 0.3;
+    brightness *= doppler;
+    
+    // Color based on temperature
+    // Hot inner: blue-white, cooler outer: orange-red
+    vec3 hotColor = vec3(0.8, 0.9, 1.0);     // Blue-white
+    vec3 warmColor = vec3(1.0, 0.7, 0.3);    // Orange
+    vec3 coolColor = vec3(1.0, 0.3, 0.1);    // Red
+    
+    vec3 diskColor = mix(coolColor, warmColor, smoothstep(0.0, 0.5, temp));
+    diskColor = mix(diskColor, hotColor, smoothstep(0.5, 1.0, temp));
+    
+    // Add emission glow
+    float glow = exp(-abs(dot(rayDir, diskNormal)) * 3.0);
+    
+    color = diskColor * brightness * (1.0 + glow * 0.5);
+    
+    // Fade at edges
+    float edgeFade = smoothstep(ACCRETION_OUTER, ACCRETION_OUTER * 0.85, r);
+    edgeFade *= smoothstep(ACCRETION_INNER, ACCRETION_INNER * 1.2, r);
+    
+    return color * edgeFade * 1.5;
+}
+
+// Render photon sphere glow - light orbiting just outside event horizon
+vec3 renderPhotonSphere(vec3 rayPos, vec3 rayDir)
+{
+    vec3 toHole = BLACK_HOLE_POS - rayPos;
+    float closestApproach = length(cross(rayDir, toHole));
+    float distAlongRay = dot(toHole, rayDir);
+    
+    // Photon sphere at 1.5x event horizon
+    float photonRadius = EVENT_HORIZON * 1.5;
+    
+    // Only render if ray passes near photon sphere and black hole is ahead
+    if(distAlongRay < 0.0) return vec3(0.0);
+    
+    // Glow intensity based on how close ray passes to photon sphere
+    float glowDist = abs(closestApproach - photonRadius);
+    float glow = exp(-glowDist * glowDist / 0.002);
+    
+    // Also add glow for rays passing very close to event horizon
+    float horizonGlow = exp(-closestApproach * closestApproach / (EVENT_HORIZON * EVENT_HORIZON * 0.3));
+    horizonGlow *= smoothstep(EVENT_HORIZON * 0.5, EVENT_HORIZON * 1.5, closestApproach);
+    
+    // Reddened light from extreme gravitational redshift
+    vec3 photonColor = vec3(1.0, 0.4, 0.1) * glow * 0.5;
+    vec3 horizonColor = vec3(0.8, 0.2, 0.05) * horizonGlow * 0.8;
+    
+    return photonColor + horizonColor;
+}
+
+// HSV to RGB conversion
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+// Generate 3 harmonious colors for a galaxy based on seed
+// Returns colors in a mat3 where each row is a color
+// Uses color harmony rules: analogous, complementary, triadic, split-complementary
+void getGalaxyPalette(float seed, out vec3 col1, out vec3 col2, out vec3 col3) {
+    // Base hue - random for each galaxy
+    float baseHue = hash(seed * 7.31);
+    
+    // Saturation and value variations
+    float baseSat = 0.5 + hash(seed * 11.17) * 0.4;  // 0.5-0.9
+    float baseVal = 0.7 + hash(seed * 13.29) * 0.3;  // 0.7-1.0
+    
+    // Choose harmony type
+    float harmonyType = hash(seed * 17.41);
+    
+    float h1, h2, h3;
+    float s1, s2, s3;
+    float v1, v2, v3;
+    
+    if(harmonyType < 0.2) {
+        // ANALOGOUS - colors next to each other on wheel (30-60 degrees apart)
+        float spread = 0.08 + hash(seed * 19.0) * 0.1;  // 30-65 degrees
+        h1 = baseHue;
+        h2 = fract(baseHue + spread);
+        h3 = fract(baseHue - spread);
+        s1 = baseSat;
+        s2 = baseSat * (0.7 + hash(seed * 21.0) * 0.3);
+        s3 = baseSat * (0.8 + hash(seed * 23.0) * 0.2);
+        v1 = baseVal;
+        v2 = baseVal * (0.85 + hash(seed * 25.0) * 0.15);
+        v3 = baseVal * (0.9 + hash(seed * 27.0) * 0.1);
+    }
+    else if(harmonyType < 0.4) {
+        // COMPLEMENTARY - opposite colors (180 degrees)
+        h1 = baseHue;
+        h2 = fract(baseHue + 0.5);  // Opposite
+        h3 = fract(baseHue + 0.5 + (hash(seed * 29.0) - 0.5) * 0.1);  // Near opposite
+        s1 = baseSat;
+        s2 = baseSat * 0.8;
+        s3 = baseSat * 0.6;
+        v1 = baseVal;
+        v2 = baseVal * 0.9;
+        v3 = baseVal;
+    }
+    else if(harmonyType < 0.6) {
+        // TRIADIC - 3 colors evenly spaced (120 degrees)
+        h1 = baseHue;
+        h2 = fract(baseHue + 0.333);
+        h3 = fract(baseHue + 0.666);
+        s1 = baseSat;
+        s2 = baseSat * (0.7 + hash(seed * 31.0) * 0.3);
+        s3 = baseSat * (0.6 + hash(seed * 33.0) * 0.4);
+        v1 = baseVal;
+        v2 = baseVal * (0.8 + hash(seed * 35.0) * 0.2);
+        v3 = baseVal * (0.85 + hash(seed * 37.0) * 0.15);
+    }
+    else if(harmonyType < 0.8) {
+        // SPLIT-COMPLEMENTARY - base + two colors adjacent to complement
+        h1 = baseHue;
+        h2 = fract(baseHue + 0.5 - 0.083);  // 150 degrees
+        h3 = fract(baseHue + 0.5 + 0.083);  // 210 degrees
+        s1 = baseSat;
+        s2 = baseSat * 0.85;
+        s3 = baseSat * 0.75;
+        v1 = baseVal;
+        v2 = baseVal * 0.95;
+        v3 = baseVal * 0.9;
+    }
+    else {
+        // TETRADIC/DOUBLE-COMPLEMENTARY - rectangle on color wheel
+        h1 = baseHue;
+        h2 = fract(baseHue + 0.25);   // 90 degrees
+        h3 = fract(baseHue + 0.5);    // 180 degrees
+        s1 = baseSat;
+        s2 = baseSat * (0.6 + hash(seed * 39.0) * 0.4);
+        s3 = baseSat * (0.7 + hash(seed * 41.0) * 0.3);
+        v1 = baseVal;
+        v2 = baseVal * (0.85 + hash(seed * 43.0) * 0.15);
+        v3 = baseVal * 0.95;
+    }
+    
+    // Convert HSV to RGB
+    col1 = hsv2rgb(vec3(h1, s1, v1));
+    col2 = hsv2rgb(vec3(h2, s2, v2));
+    col3 = hsv2rgb(vec3(h3, s3, v3));
+    
+    // Optional: Add some warmth/coolness bias based on another random
+    float tempBias = hash(seed * 47.0);
+    if(tempBias < 0.3) {
+        // Warm bias - shift toward orange/red
+        col1 = mix(col1, col1 * vec3(1.1, 0.95, 0.85), 0.2);
+        col2 = mix(col2, col2 * vec3(1.1, 0.95, 0.85), 0.15);
+        col3 = mix(col3, col3 * vec3(1.1, 0.95, 0.85), 0.1);
+    } else if(tempBias > 0.7) {
+        // Cool bias - shift toward blue
+        col1 = mix(col1, col1 * vec3(0.9, 0.95, 1.1), 0.2);
+        col2 = mix(col2, col2 * vec3(0.9, 0.95, 1.1), 0.15);
+        col3 = mix(col3, col3 * vec3(0.9, 0.95, 1.1), 0.1);
+    }
+    
+    // Clamp to valid range
+    col1 = clamp(col1, 0.0, 1.0);
+    col2 = clamp(col2, 0.0, 1.0);
+    col3 = clamp(col3, 0.0, 1.0);
+}
+
+// Simplified Hubble color palette - key colors only
+vec3 hubbleColor(float seed)
+{
+    float idx = hash(seed) * 8.0;
+    if(idx < 1.0) return vec3(0.5, 0.7, 1.0);       // Blue arms
+    if(idx < 2.0) return vec3(1.0, 0.4, 0.6);       // Pink HII regions
+    if(idx < 3.0) return vec3(1.0, 0.9, 0.7);       // Warm core
+    if(idx < 4.0) return vec3(0.6, 0.5, 1.0);       // Blue-violet
+    if(idx < 5.0) return vec3(1.0, 0.6, 0.4);       // Orange
+    if(idx < 6.0) return vec3(0.4, 0.6, 1.0);       // Deep blue
+    if(idx < 7.0) return vec3(1.0, 0.5, 0.7);       // Magenta
+    return vec3(0.7, 0.8, 1.0);                      // Pale blue
+}
+
+// Turbulent FBM for gas structures (optimized: 2 iterations)
 float turbulentFbm(vec3 p)
 {
-    float value = 0.0;
-    float amp = 0.5;
-    for(int i = 0; i < 4; i++)
-    {
-        value += amp * abs(noise3D(p) * 2.0 - 1.0);
-        p *= 2.0;
-        amp *= 0.5;
-    }
+    float value = 0.5 * abs(noise3D(p) * 2.0 - 1.0);
+    value += 0.25 * abs(noise3D(p * 2.0) * 2.0 - 1.0);
     return value;
 }
 
-// ============================================================================
-// DISCRETE STAR FIELD - generates actual point-like stars, not smooth noise
-// Returns brightness of nearest star and distance to it
-// ============================================================================
-vec2 starField(vec2 uv, float density, float seed)
+// Simple star field - returns brightness
+float starField(vec2 uv, float density, float seed)
 {
-    // Grid-based approach for discrete stars
-    vec2 gridSize = vec2(density);
-    vec2 gridUV = uv * gridSize;
+    vec2 gridUV = uv * density;
     vec2 gridCell = floor(gridUV);
     vec2 gridFract = fract(gridUV);
     
     float minDist = 1.0;
     float starBright = 0.0;
     
-    // Check 3x3 neighborhood
     for(float y = -1.0; y <= 1.0; y++)
     {
         for(float x = -1.0; x <= 1.0; x++)
         {
-            vec2 neighbor = vec2(x, y);
-            vec2 cell = gridCell + neighbor;
-            
-            // Random position within cell
+            vec2 cell = gridCell + vec2(x, y);
             float cellHash = hash(cell + seed);
-            vec2 starPos = hash3(vec3(cell, seed)).xy;
             
-            // Only some cells have stars (sparse)
-            if(cellHash > 0.7)  // 30% of cells have stars
+            if(cellHash > 0.7)
             {
-                vec2 diff = neighbor + starPos - gridFract;
+                vec2 starPos = hash3(vec3(cell, seed)).xy;
+                vec2 diff = vec2(x, y) + starPos - gridFract;
                 float dist = length(diff);
                 
                 if(dist < minDist)
                 {
                     minDist = dist;
-                    // Vary star brightness
                     starBright = 0.5 + hash(cell.x * 13.0 + cell.y * 57.0 + seed) * 0.5;
                 }
             }
         }
     }
     
-    // Sharp star point - very small radius
-    float star = smoothstep(0.08, 0.01, minDist) * starBright;
-    
-    return vec2(star, minDist);
+    return smoothstep(0.04, 0.0, minDist) * starBright;
 }
 
-// Multi-scale star field for different star populations
-float multiStarField(vec2 uv, float seed)
+// Multi-scale star field (optimized: 2 scales)
+float stars(vec2 uv, float seed)
 {
-    float stars = 0.0;
-    
-    // Bright sparse stars
-    vec2 s1 = starField(uv, 30.0, seed);
-    stars += s1.x * 1.2;
-    
-    // Medium density stars
-    vec2 s2 = starField(uv, 60.0, seed + 100.0);
-    stars += s2.x * 0.8;
-    
-    // Dense faint star background
-    vec2 s3 = starField(uv, 120.0, seed + 200.0);
-    stars += s3.x * 0.5;
-    
-    // Very dense tiny stars
-    vec2 s4 = starField(uv, 200.0, seed + 300.0);
-    stars += s4.x * 0.3;
-    
-    return min(stars, 1.5);
-}
-
-// Swirling gas texture - creates visible gas lanes and structure
-float swirlGas(vec2 uv, float ang, float r, float seed, float tightness)
-{
-    // Spiral coordinate
-    float spiralAng = ang - r * tightness;
-    
-    // Multiple layers of turbulent gas
-    float gas = 0.0;
-    
-    // Large scale gas lanes
-    float lane1 = sin(spiralAng * 2.0 + seed) * 0.5 + 0.5;
-    lane1 = pow(lane1, 0.7);
-    
-    // Medium turbulence
-    vec3 p = vec3(uv * 15.0, seed);
-    float turb1 = turbulentFbm(p);
-    
-    // Fine turbulence
-    float turb2 = turbulentFbm(p * 3.0 + 10.0);
-    
-    gas = lane1 * (0.6 + turb1 * 0.4) * (0.8 + turb2 * 0.2);
-    
-    return gas;
-}
-
-// Complex emission nebula - like Hubble images
-vec4 renderNebula(vec3 rd, vec3 center, float size, float seed)
-{
-    vec3 toCenter = rd - center;
-    float dist = length(toCenter);
-    if(dist > size * 3.0) return vec4(0.0);
-    
-    vec3 localP = toCenter / size;
-    
-    // Multi-layered turbulent structure
-    float turb1 = turbulentFbm(localP * 3.0 + vec3(seed));
-    float turb2 = turbulentFbm(localP * 6.0 + vec3(seed * 1.3));
-    float turb3 = turbulentFbm(localP * 12.0 + vec3(seed * 1.7));
-    
-    // Wispy, filamentary structure
-    float wisps = pow(turb1, 1.5) + pow(turb2, 2.0) * 0.5 + pow(turb3, 2.5) * 0.25;
-    
-    // Edge enhancement for that characteristic nebula look
-    float edge = smoothstep(size * 2.5, size * 0.5, dist);
-    float density = wisps * edge * edge;
-    
-    // Dark lanes (absorption)
-    float darkLanes = 1.0 - pow(turb2, 0.5) * 0.6;
-    density *= darkLanes;
-    
-    // Color: warm in dense regions, blue in thin ionized edges
-    vec3 warmCol = hubbleColor(seed);
-    vec3 coolCol = hubbleColor(seed + 5.0);
-    vec3 hotCol = vec3(1.0, 0.9, 0.8); // Hot star illumination
-    
-    float colorMix = turb1;
-    vec3 col = mix(warmCol, coolCol, colorMix);
-    
-    // Bright rims and edges (ionization fronts)
-    float rim = smoothstep(size * 0.8, size * 1.5, dist) * smoothstep(size * 2.0, size * 1.5, dist);
-    col = mix(col, hotCol, rim * 0.5);
-    
-    return vec4(col * density * 1.5, density);
-}
-
-// Sharp, detailed galaxy rendering - like actual Hubble images
-vec4 renderGalaxy(vec3 rd, vec3 galaxyPos, float galaxySize, float seed, float time)
-{
-    seed = seed + sessionSeed;
-    
-    // Quick rejection for galaxies far from view direction (no visible boundary)
-    float viewDist = length(rd - normalize(galaxyPos));
-    if(viewDist > galaxySize * 3.0) return vec4(0.0);
-    
-    // Galaxy orientation - VARIED viewing angles
-    // Use seed to determine inclination - some face-on, some edge-on, some tilted
-    float inclinationType = hash(seed * 5.5);
-    vec3 n;
-    
-    if(inclinationType < 0.25)
-    {
-        // Face-on (looking down the axis) - ~25%
-        n = normalize(rd);  // Normal points toward camera
-        n += (hash3(vec3(seed * 1.1, seed * 2.3, seed * 3.7)) - 0.5) * 0.3;  // Small random tilt
-        n = normalize(n);
-    }
-    else if(inclinationType < 0.45)
-    {
-        // Edge-on (~20%)
-        vec3 randDir = normalize(hash3(vec3(seed * 1.1, seed * 2.3, seed * 3.7)) * 2.0 - 1.0);
-        n = normalize(cross(rd, randDir));  // Perpendicular to view
-        n += (hash3(vec3(seed * 4.1, seed * 5.3, seed * 6.7)) - 0.5) * 0.2;
-        n = normalize(n);
-    }
-    else
-    {
-        // Random tilt (~55%) - the default varied orientation
-        n = normalize(hash3(vec3(seed * 1.1, seed * 2.3, seed * 3.7)) * 2.0 - 1.0);
-    }
-    
-    vec3 t = normalize(cross(n, vec3(0.0, 1.0, 0.1)));
-    if(length(cross(n, vec3(0.0, 1.0, 0.1))) < 0.1) t = normalize(cross(n, vec3(1.0, 0.0, 0.1)));
-    vec3 b = cross(n, t);
-    
-    vec3 localRd = rd - normalize(galaxyPos);
-    float planeDist = dot(localRd, n);
-    vec2 uv = vec2(dot(localRd, t), dot(localRd, b));
-    
-    float r = length(uv);
-    
-    // Early exit if outside galaxy radius - no visible edge artifact
-    if(r > galaxySize * 1.2) return vec4(0.0);
-    
-    float ang = atan(uv.y, uv.x);
-    
-    // Unique per-galaxy parameters
-    float rotAng = seed * 10.0 + time * (hash(seed * 8.0) - 0.5) * 0.2;
-    float gtype = hash(seed * 7.0);
-    
-    vec3 color = vec3(0.0);
-    float bright = 0.0;
-    
-    // Noise coordinates
-    vec2 nuv = uv / galaxySize;
-    
-    // DISCRETE STAR FIELD for visible individual stars
-    float stars = multiStarField(nuv * 1.2, seed);
-    
-    // Gas and dust textures
-    float gasNoise = turbulentFbm(vec3(nuv * 10.0, seed * 2.1));
-    float dustNoise = turbulentFbm(vec3(nuv * 15.0, seed * 2.5));
-    float gasSwirl = swirlGas(nuv, ang, r / galaxySize, seed, 5.0);
-    
-    // GALAXY TYPE SELECTION - much more variety
-    if(gtype < 0.30)
-    {
-        // === GRAND DESIGN SPIRAL (M51/Whirlpool style) ===
-        float numArms = 2.0;
-        float pitch = 0.35 + hash(seed * 14.0) * 0.25;
-        
-        // Logarithmic spiral arms
-        float logR = log(r / galaxySize * 20.0 + 1.0);
-        float spiralAngle = ang + rotAng - logR / pitch;
-        
-        // THIN arm structure - narrower arms like in real spirals
-        float armPhase = mod(spiralAngle * numArms / 6.28 + 0.5, 1.0);
-        float armBase = smoothstep(0.38, 0.46, armPhase) * smoothstep(0.62, 0.54, armPhase);
-        
-        // Add noise to arm edges for irregular, wispy look
-        float armNoise = noise3D(vec3(nuv * 50.0 + spiralAngle, seed * 3.0));
-        float arm = armBase * (0.6 + armNoise * 0.6);
-        arm *= max(0.0, 1.0 - r / galaxySize);
-        arm *= arm;  // Square it to make arms more defined with darker gaps
-        
-        // Thin dust lanes
-        float dustPhase = mod(spiralAngle * numArms / 6.28 + 0.51, 1.0);
-        float dustBase = smoothstep(0.42, 0.46, dustPhase) * smoothstep(0.52, 0.48, dustPhase);
-        float dust = dustBase * (0.4 + dustNoise * 0.6);
-        dust *= smoothstep(galaxySize * 0.08, galaxySize * 0.35, r);
-        dust *= max(0.0, 1.0 - r / (galaxySize * 0.8));
-        
-        // Small bright HII knots scattered in arms
-        float hiiKnots = 0.0;
-        for(float k = 0.0; k < 20.0; k++)
-        {
-            float kSeed = seed + k * 73.0;
-            float kAng = hash(kSeed) * 6.28;
-            float kR = (0.12 + hash(kSeed + 1.0) * 0.65) * galaxySize;
-            vec2 kPos = vec2(cos(kAng + rotAng), sin(kAng + rotAng)) * kR;
-            float kDist = length(uv - kPos);
-            float kSize = galaxySize * (0.004 + hash(kSeed + 3.0) * 0.012);  // Smaller knots
-            float knot = smoothstep(kSize, kSize * 0.1, kDist);  // Sharper edges
-            hiiKnots += knot * arm * hash(kSeed + 2.0);
-        }
-        
-        // Blue star clusters - small and bright
-        float blueClusters = 0.0;
-        for(float s = 0.0; s < 15.0; s++)
-        {
-            float sSeed = seed + s * 91.0 + 500.0;
-            float sAng = hash(sSeed) * 6.28;
-            float sR = (0.15 + hash(sSeed + 1.0) * 0.6) * galaxySize;
-            vec2 sPos = vec2(cos(sAng + rotAng), sin(sAng + rotAng)) * sR;
-            float sDist = length(uv - sPos);
-            float sSize = galaxySize * (0.003 + hash(sSeed + 2.0) * 0.01);  // Smaller
-            blueClusters += smoothstep(sSize, sSize * 0.1, sDist) * arm * hash(sSeed + 3.0);
-        }
-        
-        // Compact central bulge
-        float bulge = smoothstep(galaxySize * 0.12, galaxySize * 0.01, r);
-        bulge *= bulge;  // Make it more concentrated
-        
-        // Bright compact core
-        float core = smoothstep(galaxySize * 0.025, galaxySize * 0.002, r);
-        
-        // Stars appear as sparse points within the arm structure
-        float armStars = arm * stars;
-        float bulgeStars = bulge * stars;
-        
-        bright = armStars * 0.8 + bulgeStars * 0.6 + core * 0.5 + hiiKnots * 0.7 + blueClusters * 0.5;
-        bright = max(bright - dust * 0.4, 0.0);
-        
-        // === RICH COLOR MIXING ===
-        // Arm colors vary with radius (bluer outer, redder inner)
-        float radialGrad = r / galaxySize;
-        vec3 innerArmCol = vec3(1.0, 0.85, 0.7);   // Warm inner arms
-        vec3 outerArmCol = vec3(0.6, 0.75, 1.0);   // Blue outer arms
-        vec3 armCol = mix(innerArmCol, outerArmCol, radialGrad);
-        
-        // Add color variation from gas
-        vec3 gasCol1 = hubbleColor(seed * 10.0);
-        vec3 gasCol2 = hubbleColor(seed * 11.0);
-        armCol = mix(armCol, gasCol1, gasNoise * 0.3);
-        armCol = mix(armCol, gasCol2, (1.0 - gasNoise) * stars * 0.2);
-        
-        // Bulge gradient (yellow center to red edge)
-        vec3 bulgeInner = vec3(1.0, 0.95, 0.85);
-        vec3 bulgeOuter = vec3(1.0, 0.75, 0.5);
-        vec3 bulgeCol = mix(bulgeInner, bulgeOuter, r / (galaxySize * 0.2));
-        
-        // Core is hot white/blue
-        vec3 coreCol = vec3(1.0, 0.98, 1.0);
-        
-        // HII regions are pink/magenta
-        vec3 hiiCol = mix(vec3(1.0, 0.3, 0.5), vec3(1.0, 0.5, 0.7), hash(seed * 20.0));
-        
-        // Blue clusters
-        vec3 blueCol = vec3(0.4, 0.6, 1.0);
-        
-        // Dust is dark brown/red
-        vec3 dustCol = vec3(0.25, 0.12, 0.06);
-        
-        // Combine all colors
-        color = armCol * armStars * 1.0;
-        color += bulgeCol * bulgeStars * 0.8;
-        color = mix(color, coreCol * 0.6, core * 0.4);
-        color = mix(color, dustCol, dust * 0.3);
-        color += hiiCol * hiiKnots * 1.0;
-        color += blueCol * blueClusters * 0.9;
-    }
-    else if(gtype < 0.45)
-    {
-        // === BARRED SPIRAL (NGC 1300 style) ===
-        vec2 ruv = uv * rot2D(seed * 2.0 + rotAng * 0.1);
-        float barLen = 0.3 * galaxySize;
-        float barWidth = 0.06 * galaxySize;  // Thinner bar
-        
-        // Bar structure with sparse stars
-        float barBase = smoothstep(barWidth, barWidth * 0.3, abs(ruv.y));
-        barBase *= smoothstep(barLen, barLen * 0.5, abs(ruv.x));
-        barBase *= barBase;  // Sharper edges
-        float barStars = barBase * stars;
-        
-        // Thin dust lanes
-        float barDust = smoothstep(barWidth * 0.5, barWidth * 0.15, abs(ruv.y));
-        barDust *= smoothstep(barLen * 0.2, barLen * 0.75, abs(ruv.x));
-        barDust *= dustNoise * 0.6;
-        
-        // THINNER arms emerging from bar ends
-        float arms = 0.0;
-        for(float side = -1.0; side <= 1.0; side += 2.0)
-        {
-            vec2 armStart = vec2(side * barLen * 0.8, 0.0);
-            vec2 toP = ruv - armStart;
-            float armR = length(toP);
-            float armA = atan(toP.y, toP.x * side);
-            
-            float spiral = armA - armR * 3.0 / galaxySize;
-            float armNoise = noise3D(vec3(toP / galaxySize * 30.0, seed * 4.0));
-            float armVal = smoothstep(0.5, 0.35, abs(mod(spiral, 3.14) - 1.57));  // Thinner
-            armVal *= (0.5 + armNoise * 0.6);
-            armVal *= max(0.0, 1.0 - armR / galaxySize);
-            armVal *= armVal;  // Sharper
-            arms += armVal;
-        }
-        
-        // Small HII knots
-        float hii = 0.0;
-        for(float k = 0.0; k < 12.0; k++)
-        {
-            float kSeed = seed + k * 67.0;
-            vec2 kPos = (hash3(vec3(kSeed)).xy - 0.5) * galaxySize * 1.2;
-            float kDist = length(uv - kPos);
-            float kSize = galaxySize * (0.004 + hash(kSeed + 1.0) * 0.01);  // Smaller
-            hii += smoothstep(kSize, kSize * 0.1, kDist) * arms * hash(kSeed + 2.0);
-        }
-        
-        float core = smoothstep(galaxySize * 0.06, galaxySize * 0.005, r);
-        
-        // Sparse star points
-        float armStars = arms * stars;
-        bright = barStars * 0.6 + armStars * 0.7 + core * 0.5 + hii * 0.6;
-        bright = max(bright - barDust * 0.35, 0.0);
-        
-        // Rich color mixing
-        vec3 barInner = vec3(1.0, 0.9, 0.75);
-        vec3 barOuter = vec3(0.9, 0.7, 0.5);
-        vec3 barCol = mix(barInner, barOuter, abs(ruv.x) / barLen);
-        barCol *= (0.8 + stars * 0.4);
-        
-        vec3 armCol = mix(vec3(0.7, 0.8, 1.0), vec3(0.9, 0.85, 0.8), gasNoise);
-        vec3 coreCol = vec3(1.0, 0.95, 0.9);
-        vec3 hiiCol = vec3(1.0, 0.4, 0.6);
-        vec3 dustCol = vec3(0.2, 0.1, 0.05);
-        
-        color = barCol * barStars * 1.0;
-        color += armCol * armStars * 1.0;
-        color = mix(color, coreCol * 0.6, core * 0.4);
-        color = mix(color, dustCol, barDust * 0.25);
-        color += hiiCol * hii * 1.0;
-    }
-    else if(gtype < 0.55)
-    {
-        // === EDGE-ON SPIRAL (NGC 4565 style) ===
-        vec2 ruv = uv * rot2D(seed * 3.0);
-        
-        // THIN edge-on disk with sparse stars
-        float diskHeight = 0.018 * galaxySize;  // Thinner
-        float diskBase = smoothstep(diskHeight * 1.5, diskHeight * 0.15, abs(ruv.y));
-        diskBase *= max(0.0, 1.0 - abs(ruv.x) / galaxySize);
-        diskBase *= diskBase;  // Sharper edges
-        float diskStars = diskBase * stars;
-        
-        // Sharp dust lane
-        float dustLane = smoothstep(diskHeight * 0.8, diskHeight * 0.1, abs(ruv.y));
-        dustLane *= smoothstep(galaxySize * 0.08, galaxySize * 0.55, abs(ruv.x));
-        dustLane *= (0.4 + dustNoise * 0.6);
-        
-        // Compact bulge
-        float bulgeBase = smoothstep(galaxySize * 0.08, galaxySize * 0.005, length(ruv));
-        bulgeBase *= bulgeBase;
-        float bulgeStars = bulgeBase * stars;
-        
-        bright = diskStars * 0.7 + bulgeStars * 0.6;
-        bright = max(bright - dustLane * 0.5, 0.0);
-        
-        // Color gradient along disk
-        float xGrad = abs(ruv.x) / galaxySize;
-        vec3 diskInner = vec3(1.0, 0.9, 0.75);
-        vec3 diskOuter = vec3(0.7, 0.8, 1.0);
-        vec3 diskCol = mix(diskInner, diskOuter, xGrad);
-        
-        vec3 bulgeCol = vec3(1.0, 0.88, 0.7);
-        vec3 dustCol = vec3(0.15, 0.08, 0.03);
-        
-        color = diskCol * diskStars * 1.1;
-        color += bulgeCol * bulgeStars * 0.9;
-        color = mix(color, dustCol, dustLane * 0.25);
-    }
-    else if(gtype < 0.70)
-    {
-        // === INTERACTING GALAXIES (Arp 248 style) ===
-        // Primary galaxy with spiral structure
-        float r1 = r;
-        float ang1 = ang;
-        float spiral1 = 0.5 + 0.5 * sin(ang1 * 2.0 - r1 * 5.0 / galaxySize + rotAng);
-        float gal1Base = smoothstep(galaxySize * 0.4, galaxySize * 0.02, r1);
-        gal1Base *= gal1Base;  // More concentrated
-        gal1Base *= (0.5 + spiral1 * 0.5);
-        float gal1Stars = gal1Base * stars;
-        float core1 = smoothstep(galaxySize * 0.05, galaxySize * 0.005, r1);
-        
-        // Secondary galaxy
-        vec2 g2Offset = vec2(0.6, 0.35) * galaxySize * (hash(seed * 24.0) * 0.4 + 0.6);
-        g2Offset *= rot2D(seed * 5.0);
-        float r2 = length(uv - g2Offset);
-        float ang2 = atan(uv.y - g2Offset.y, uv.x - g2Offset.x);
-        float spiral2 = 0.5 + 0.5 * sin(ang2 * 2.0 + r2 * 6.0 / galaxySize);
-        vec2 nuv2 = (uv - g2Offset) / galaxySize;
-        float stars2 = pow(noise3D(vec3(nuv2 * 300.0, seed * 5.0)), 3.0);
-        stars2 = smoothstep(0.2, 0.8, stars2);
-        float gal2Base = smoothstep(galaxySize * 0.35, galaxySize * 0.02, r2);
-        gal2Base *= gal2Base;
-        gal2Base *= (0.4 + spiral2 * 0.5);
-        float gal2Stars = gal2Base * stars2;
-        float core2 = smoothstep(galaxySize * 0.04, galaxySize * 0.003, r2);
-        
-        // THIN WISPY tidal tails like in Arp 248
-        float tailAng = atan(g2Offset.y, g2Offset.x);
-        
-        // Tail 1 - thin stream
-        float t1Phase = ang1 - tailAng - r1 * 2.0 / galaxySize;
-        float tail1Width = smoothstep(0.5, 0.1, abs(mod(t1Phase + 3.14, 6.28) - 3.14));  // Thinner
-        tail1Width *= smoothstep(0.0, 0.15 * galaxySize, r1);
-        tail1Width *= max(0.0, 1.0 - r1 / (galaxySize * 1.5));
-        tail1Width *= tail1Width;  // Square for sharper edges
-        float tail1Stars = tail1Width * stars * 0.6;
-        
-        // Tail 2 - thin stream
-        float t2Phase = ang2 - tailAng + 3.14 + r2 * 2.5 / galaxySize;
-        float tail2Width = smoothstep(0.45, 0.1, abs(mod(t2Phase + 3.14, 6.28) - 3.14));
-        tail2Width *= smoothstep(0.0, 0.12 * galaxySize, r2);
-        tail2Width *= max(0.0, 1.0 - r2 / (galaxySize * 1.3));
-        tail2Width *= tail2Width;
-        float tail2Stars = tail2Width * stars2 * 0.5;
-        
-        // Thin bridge connecting galaxies
-        vec2 bridgeDir = normalize(g2Offset);
-        float bridgeDist = dot(uv, bridgeDir);
-        float bridgePerp = abs(dot(uv, vec2(-bridgeDir.y, bridgeDir.x)));
-        float bridgeLen = length(g2Offset);
-        float bridgeBase = smoothstep(galaxySize * 0.025, galaxySize * 0.005, bridgePerp);  // Much thinner
-        bridgeBase *= smoothstep(0.0, bridgeLen * 0.25, bridgeDist);
-        bridgeBase *= smoothstep(bridgeLen, bridgeLen * 0.65, bridgeDist);
-        float bridgeStars = bridgeBase * stars * 0.4;
-        
-        // Small bright blue knots along tails/bridge
-        float knots = 0.0;
-        for(float k = 0.0; k < 15.0; k++)
-        {
-            float kSeed = seed + k * 47.0;
-            float kT = hash(kSeed) * 0.9 + 0.05;
-            vec2 kPos = mix(vec2(0.0), g2Offset, kT);
-            kPos += (hash3(vec3(kSeed)).xy - 0.5) * 0.15 * galaxySize;
-            float kDist = length(uv - kPos);
-            float kSize = galaxySize * (0.003 + hash(kSeed + 3.0) * 0.008);  // Smaller knots
-            knots += smoothstep(kSize, kSize * 0.1, kDist) * (tail1Width + tail2Width + bridgeBase) * hash(kSeed + 2.0);
-        }
-        
-        bright = gal1Stars * 0.7 + gal2Stars * 0.6 + core1 * 0.5 + core2 * 0.4;
-        bright += tail1Stars * 0.8 + tail2Stars * 0.7 + bridgeStars * 0.6 + knots * 0.8;
-        
-        // Colors
-        float radGrad1 = r1 / (galaxySize * 0.4);
-        float radGrad2 = r2 / (galaxySize * 0.35);
-        vec3 gal1Inner = vec3(1.0, 0.85, 0.65);
-        vec3 gal1Outer = vec3(0.6, 0.75, 1.0);
-        vec3 gal1Col = mix(gal1Inner, gal1Outer, radGrad1);
-        
-        vec3 gal2Inner = vec3(1.0, 0.8, 0.6);
-        vec3 gal2Outer = vec3(0.55, 0.7, 1.0);
-        vec3 gal2Col = mix(gal2Inner, gal2Outer, radGrad2);
-        
-        vec3 coreCol = vec3(1.0, 0.95, 0.85);
-        vec3 tailCol = vec3(0.65, 0.8, 1.0);  // Bluish tails
-        vec3 knotCol = vec3(0.5, 0.7, 1.0);   // Blue knots
-        
-        color = gal1Col * gal1Stars * 1.1 + gal2Col * gal2Stars * 1.0;
-        color = mix(color, coreCol, (core1 + core2) * 0.4);
-        color += tailCol * (tail1Stars + tail2Stars + bridgeStars) * 1.0;
-        color += knotCol * knots * 0.9;
-    }
-    else if(gtype < 0.82)
-    {
-        // === ELLIPTICAL GALAXY ===
-        float ellip = 0.3 + hash(seed * 26.0) * 0.5;
-        vec2 euv = uv * rot2D(seed * 4.0);
-        euv.y /= ellip;
-        float eR = length(euv);
-        
-        // Elliptical - sparse star points
-        float profileBase = max(0.0, 1.0 - eR / (galaxySize * 0.4));
-        profileBase = profileBase * profileBase * profileBase;  // More concentrated
-        float profileStars = profileBase * stars;
-        float core = smoothstep(galaxySize * 0.05, galaxySize * 0.003, eR);
-        
-        bright = profileStars * 0.7 + core * 0.5;
-        
-        // Color gradient from center outward
-        float colorGrad = eR / (galaxySize * 0.4);
-        vec3 coreCol = vec3(1.0, 0.95, 0.88);
-        vec3 midCol = vec3(1.0, 0.82, 0.6);
-        vec3 outerCol = vec3(0.85, 0.6, 0.45);
-        vec3 ellipCol = mix(coreCol, midCol, min(colorGrad, 1.0));
-        ellipCol = mix(ellipCol, outerCol, max(0.0, colorGrad - 0.5) * 2.0);
-        ellipCol *= (0.85 + stars * 0.3);
-        
-        color = ellipCol * profileStars * 1.0;
-        color = mix(color, coreCol * 0.6, core * 0.4);
-    }
-    else if(gtype < 0.92)
-    {
-        // === RING GALAXY (Hoag's Object style) ===
-        float ringR = 0.5 * galaxySize;
-        float ringW = 0.04 * galaxySize;  // Thinner ring
-        
-        // Ring - stars defines visible individual stars
-        float ringBase = smoothstep(ringW, ringW * 0.1, abs(r - ringR));
-        float ringStars = ringBase * stars;
-        
-        // Star forming knots around ring - use stars
-        float knotSum = 0.0;
-        for(float k = 0.0; k < 12.0; k++)
-        {
-            float kSeed = seed + k * 53.0;
-            float kAng = k * 6.28 / 12.0 + hash(kSeed) * 0.5;
-            vec2 kPos = vec2(cos(kAng), sin(kAng)) * ringR;
-            float kDist = length(uv - kPos);
-            float kSize = galaxySize * (0.01 + hash(kSeed + 1.0) * 0.015);  // Smaller knots
-            knotSum += smoothstep(kSize * 1.2, kSize * 0.15, kDist) * hash(kSeed + 2.0);
-        }
-        float knots = knotSum * ringBase * stars;  // Knots also use stars
-        
-        // Central elliptical with star texture
-        float coreBase = smoothstep(galaxySize * 0.08, galaxySize * 0.01, r);  // Smaller core
-        float coreStars = coreBase * stars * 0.7;
-        
-        bright = ringStars * 0.5 + knots * 0.4 + coreStars * 0.4;
-        
-        // Ring is blue with pink knots
-        vec3 ringCol = vec3(0.5, 0.7, 1.0);
-        vec3 knotCol = vec3(1.0, 0.45, 0.65);
-        vec3 coreCol = vec3(1.0, 0.88, 0.72);
-        
-        color = ringCol * ringStars * 1.0;
-        color += knotCol * knots * 0.9;
-        color += coreCol * coreStars * 0.7;
-    }
-    else
-    {
-        // === IRREGULAR GALAXY (LMC/SMC style) ===
-        // Use sparse stars for visible individual stars
-        
-        // Chaotic structure noise
-        float n1 = turbulentFbm(vec3(nuv * 3.0, seed * 3.0));
-        float n2 = turbulentFbm(vec3(nuv * 5.0 + 10.0, seed * 3.5));
-        float n3 = turbulentFbm(vec3(nuv * 7.0 + 20.0, seed * 4.0));
-        
-        // Chaotic structural mask - stars only visible where structure is
-        float structMask = smoothstep(0.3, 0.6, n1) + smoothstep(0.4, 0.7, n2) * 0.5;
-        structMask *= max(0.0, 1.0 - r / galaxySize);
-        structMask *= structMask;
-        
-        // Stars define the visible structure - use sparse stars
-        float visibleStars = structMask * stars;
-        
-        // Clumps are high-density star regions with point-like stars
-        float clump1 = smoothstep(0.55, 0.8, n1 * n2) * stars;
-        float clump2 = smoothstep(0.5, 0.75, n2 * n3) * stars;
-        
-        // Star forming regions - bright blue knots
-        float sfr = smoothstep(0.6, 0.9, n2 * n3) * structMask * stars;
-        
-        bright = visibleStars * 0.4 + clump1 * 0.3 + clump2 * 0.25 + sfr * 0.3;
-        
-        // Color palette
-        vec3 baseCol = hubbleColor(seed * 22.0);
-        vec3 clump1Col = hubbleColor(seed * 23.0 + 8.0);
-        vec3 clump2Col = hubbleColor(seed * 24.0 + 15.0);
-        vec3 sfrCol = vec3(0.5, 0.7, 1.0);  // Blue star forming regions
-        
-        // Color follows the star structure
-        color = baseCol * visibleStars * 0.9;
-        color += clump1Col * clump1 * 0.8;
-        color += clump2Col * clump2 * 0.7;
-        color += sfrCol * sfr * 0.9;
-    }
-    
-    // Final output - balanced brightness
-    vec3 finalColor = color * 1.2;
-    
-    // Clamp to prevent blowout
-    finalColor = clamp(finalColor, 0.0, 0.75);
-    
-    return vec4(finalColor, bright);
+    float s = starField(uv, 40.0, seed) * 1.0;
+    s += starField(uv, 80.0, seed + 100.0) * 0.6;
+    return min(s, 1.5);
 }
 
 // ============================================================================
-// ULTRA-DETAILED NEARFIELD GALAXY - Like actual Hubble images
-// This is for 1-3 massive galaxies that fill a significant portion of view
+// GALAXY RENDERER - Hubble-style with visible internal structure
 // ============================================================================
-vec4 renderNearfieldGalaxy(vec3 rd, vec3 galaxyPos, float galaxySize, float seed, float time)
+vec4 renderGalaxy(vec3 rd, vec3 galaxyPos, float galaxySize, float seed, float time, int forceType)
 {
     seed = seed + sessionSeed;
     
     // Quick rejection
     float viewDist = length(rd - normalize(galaxyPos));
-    if(viewDist > galaxySize * 2.5) return vec4(0.0);
+    if(viewDist > galaxySize * 2.0) return vec4(0.0);
     
-    // Galaxy plane orientation - bias toward face-on for detail visibility
-    float inclinationType = hash(seed * 5.5);
-    vec3 n;
+    // Galaxy orientation - random tilt for variety
+    vec3 galaxyNormal = normalize(galaxyPos);
+    float tiltX = (hash(seed * 1.1) - 0.5) * 1.2;  // More random tilt
+    float tiltY = (hash(seed * 2.3) - 0.5) * 1.2;
+    galaxyNormal = normalize(galaxyNormal + vec3(tiltX, tiltY, 0.0) * 0.5);
     
-    if(inclinationType < 0.6)
-    {
-        // Mostly face-on to show arm detail
-        n = normalize(rd);
-        n += (hash3(vec3(seed * 1.1, seed * 2.3, seed * 3.7)) - 0.5) * 0.4;
-        n = normalize(n);
-    }
-    else if(inclinationType < 0.8)
-    {
-        // Tilted - like the reference image
-        n = normalize(rd);
-        n += (hash3(vec3(seed * 1.1, seed * 2.3, seed * 3.7)) - 0.5) * 0.8;
-        n = normalize(n);
-    }
-    else
-    {
-        // Edge-on
-        vec3 randDir = normalize(hash3(vec3(seed * 1.1, seed * 2.3, seed * 3.7)) * 2.0 - 1.0);
-        n = normalize(cross(rd, randDir));
-    }
-    
-    vec3 t = normalize(cross(n, vec3(0.0, 1.0, 0.1)));
-    if(length(cross(n, vec3(0.0, 1.0, 0.1))) < 0.1) t = normalize(cross(n, vec3(1.0, 0.0, 0.1)));
-    vec3 b = cross(n, t);
+    vec3 t = normalize(cross(galaxyNormal, vec3(0.0, 1.0, 0.1)));
+    if(length(cross(galaxyNormal, vec3(0.0, 1.0, 0.1))) < 0.1) 
+        t = normalize(cross(galaxyNormal, vec3(1.0, 0.0, 0.1)));
+    vec3 b = cross(galaxyNormal, t);
     
     vec3 localRd = rd - normalize(galaxyPos);
     vec2 uv = vec2(dot(localRd, t), dot(localRd, b));
@@ -890,618 +762,1212 @@ vec4 renderNearfieldGalaxy(vec3 rd, vec3 galaxyPos, float galaxySize, float seed
     float ang = atan(uv.y, uv.x);
     vec2 nuv = uv / galaxySize;
     
-    // ========== DISCRETE STAR FIELD - actual point-like stars ==========
-    float stars = multiStarField(nuv * 1.5, seed);
-    
-    // Additional very bright foreground stars
-    vec2 brightStar = starField(nuv * 0.8, 15.0, seed + 500.0);
-    stars += brightStar.x * 1.5;
-    
-    // ========== SWIRLING GAS TEXTURE ==========
-    float armTightness = 5.0 + hash(seed * 12.0) * 3.0;
-    float gasSwirl = swirlGas(nuv, ang, r / galaxySize, seed, armTightness);
-    
-    // Multi-scale gas turbulence
-    float gas1 = turbulentFbm(vec3(nuv * 8.0, seed * 2.5));
-    float gas2 = turbulentFbm(vec3(nuv * 20.0, seed * 2.8));
-    float gas3 = noise3D(vec3(nuv * 50.0, seed * 3.1));
-    float gasNoise = gas1 * 0.5 + gas2 * 0.3 + gas3 * 0.2;
-    
-    // Dust lanes - dark absorption
-    float dust1 = turbulentFbm(vec3(nuv * 12.0, seed * 3.5));
-    float dust2 = noise3D(vec3(nuv * 25.0, seed * 3.8));
-    float dustNoise = dust1 * 0.6 + dust2 * 0.4;
+    // Fine detail noise
+    float turb = turbulentFbm(vec3(nuv * 8.0, seed));
+    float dust = noise3D(vec3(nuv * 12.0, seed * 3.0));
     
     vec3 color = vec3(0.0);
-    float bright = 0.0;
+    float alpha = 0.0;
     
-    // Force barred spiral like reference image (or regular spiral)
-    float gtype = hash(seed * 7.0);
+    // Galaxy type - 0=spiral, 1=barred spiral, 2=elliptical, 3=irregular, 4=edge-on
+    int gtype = forceType >= 0 ? forceType : int(hash(seed * 7.0) * 5.0);
     
-    if(gtype < 0.7)
+    if(gtype == 0)
     {
-        // ===== BARRED SPIRAL (like Hubble reference image) =====
+        // === SPIRAL GALAXY - ANIMATED WITH FAST SPINNING, ARM MERGING, GAS SWIRLING ===
         
-        float barAng = seed * 3.14159;
-        mat2 barRot = rot2D(barAng);
-        vec2 ruv = barRot * uv;
+        // FAST VISIBLE ROTATION - each galaxy spins noticeably
+        float spinSpeed = 0.15 + hash(seed * 6.1) * 0.2;  // Much faster spin
+        float rotAng = seed * 10.0 + time * spinSpeed;
         
-        float barLen = galaxySize * 0.35;
-        float barWidth = galaxySize * 0.1;
+        // EXTREME randomization - every galaxy wildly unique
         
-        // Bar shape
-        float barX = abs(ruv.x) / barLen;
-        float barTaper = 1.0 - smoothstep(0.5, 1.0, barX);
-        float barY = abs(ruv.y) / (barWidth * barTaper + 0.001);
-        float bar = smoothstep(1.0, 0.6, max(barX, barY * 0.8));
+        // Random arm count (1-7, weighted)
+        float armRand = hash(seed * 5.5);
+        float numArms = armRand < 0.08 ? 1.0 : (armRand < 0.2 ? 2.0 : (armRand < 0.45 ? 3.0 : (armRand < 0.7 ? 4.0 : (armRand < 0.88 ? 5.0 : (armRand < 0.96 ? 6.0 : 7.0)))));
         
-        // Dark dust lane through bar
-        float barDustLane = smoothstep(barWidth * 0.4, barWidth * 0.05, abs(ruv.y));
-        barDustLane *= smoothstep(0.0, barLen * 0.7, abs(ruv.x));
+        // Spiral tightness - HUGE range from very open to extremely tight
+        float spiralTightness = 0.5 + hash(seed * 12.0) * 8.0;
         
-        // ===== SPIRAL ARMS with visible structure =====
-        float numArms = 2.0;
+        // Arm width - extremely thin wispy to very thick fluffy
+        float armWidth = 0.1 + hash(seed * 17.0) * 1.2;
+        
+        // Strong asymmetry - arms can be VERY different strengths
+        float asymmetry = pow(hash(seed * 22.0), 0.7) * 0.95;
+        
+        // Flocculence - smooth to extremely patchy/broken
+        float flocculence = pow(hash(seed * 27.0), 0.5) * 1.0;
+        
+        // Pitch variation - arms can wobble dramatically
+        float pitchVar = hash(seed * 33.0) * 1.2;
+        
+        // Random overall warp/distortion - some galaxies very warped
+        float warpStrength = pow(hash(seed * 38.0), 0.8) * 0.6;
+        float warpFreq = 0.5 + hash(seed * 43.0) * 4.0;
+        
+        // NEW: Overall galaxy stretch/squash
+        float stretchX = 0.7 + hash(seed * 48.0) * 0.6;
+        float stretchY = 0.7 + hash(seed * 49.0) * 0.6;
+        
+        // Build spiral arms with EXTREME randomness
+        // Apply stretch and random warp to UV coordinates
+        vec2 warpedUV = nuv;
+        warpedUV.x *= stretchX;
+        warpedUV.y *= stretchY;
+        
+        // FAST SWIRLING GAS - visible movement
+        float swirlTime = time * 0.3;
+        warpedUV += vec2(
+            sin(warpedUV.y * warpFreq * 10.0 + swirlTime * 2.0), 
+            cos(warpedUV.x * warpFreq * 10.0 - swirlTime * 1.5)
+        ) * warpStrength * 0.15;
+        
+        float warpedR = length(warpedUV) * galaxySize;
+        float warpedAng = atan(warpedUV.y, warpedUV.x);
+        
+        float spiralAng = warpedAng + rotAng - log(max(warpedR / galaxySize, 0.01)) * spiralTightness;
+        // Add pitch variation - animated fast
+        spiralAng += sin(warpedR / galaxySize * 6.0 + seed + time * 0.2) * pitchVar;
+        spiralAng += cos(warpedR / galaxySize * 11.0 + seed * 2.0 - time * 0.15) * pitchVar * 0.5;
+        
+        // FAST ARM MERGING - arms blend together visibly
+        float mergePhase = sin(time * 0.4 + seed * 5.0) * 0.5 + 0.5;  // Faster oscillation
+        float armMerge = 0.3 + mergePhase * 0.4;  // How much arms blend
+        
+        // Multi-arm structure with per-arm randomization and MERGING
         float arms = 0.0;
-        
-        for(float a = 0.0; a < numArms; a++)
+        float armAccum = 0.0;  // For soft merging
+        for(float arm = 0.0; arm < 7.0; arm++)
         {
-            float armPhase = a * 3.14159 + barAng;
-            float armAng = ang - armPhase - r * armTightness / galaxySize;
+            if(arm >= numArms) break;
+            // Each arm has random offset (not evenly spaced)
+            float baseOffset = arm * 6.28 / numArms;
+            float armJitter = (hash(seed + arm * 77.0) - 0.5) * 0.8;
+            // Animated jitter - arms shift position fast
+            armJitter += sin(time * 0.25 + arm * 2.0 + seed) * 0.2;
+            float armOffset = baseOffset + armJitter;
             
-            // Arm core
-            float armWave = 0.5 + 0.5 * sin(armAng * numArms);
-            float armWidth = 0.15 + gas2 * 0.1;  // Vary width with gas
-            float armCore = smoothstep(0.5 - armWidth, 0.5 - armWidth * 0.3, armWave);
-            armCore *= smoothstep(0.5 + armWidth, 0.5 + armWidth * 0.3, armWave);
+            // Each arm has different strength AND different width
+            float armStrength = 0.4 + hash(seed + arm * 13.0) * 0.6;
+            // Animated strength variation - faster
+            armStrength *= 0.7 + 0.3 * sin(time * 0.3 + arm * 1.5 + seed);
+            armStrength *= (1.0 - asymmetry * sin(arm * 2.7 + seed));
+            float thisArmWidth = armWidth * (0.6 + hash(seed + arm * 19.0) * 0.8);
             
-            // Feathery edges from gas turbulence
-            armCore *= (0.5 + gas1 * 0.5);
+            float armPhase = spiralAng * numArms / 2.0 + armOffset;
+            float armWave = sin(armPhase);
+            float thisArm = pow(max(armWave, 0.0), 1.0 + thisArmWidth);
+            thisArm *= armStrength;
             
-            // Arm fades at center and outer edge
-            float armFade = smoothstep(galaxySize * 0.12, galaxySize * 0.2, r);
-            armFade *= smoothstep(galaxySize * 1.1, galaxySize * 0.6, r);
-            
-            arms += armCore * armFade;
+            // Accumulate for soft merging instead of hard max
+            armAccum += thisArm;
+            arms = max(arms, thisArm);
         }
-        arms = min(arms, 1.0);
+        // Blend between max (distinct arms) and sum (merged arms)
+        arms = mix(arms, min(armAccum * 0.5, 1.2), armMerge);
         
-        // ===== DARK DUST LANES winding through =====
-        float dustLanes = smoothstep(0.4, 0.6, dustNoise) * arms * 0.8;
-        dustLanes += barDustLane * (1.0 - bar * 0.5) * 0.6;
+        // Radial falloff
+        arms *= smoothstep(galaxySize * 0.98, galaxySize * 0.12, r);
+        arms *= smoothstep(galaxySize * 0.02, galaxySize * 0.08, r);
         
-        // ===== PINK HII REGIONS scattered in arms =====
+        // Flocculence - breaks up the arms - FAST ANIMATION
+        float floc1 = noise3D(vec3(nuv * 18.0 + time * 0.1, seed * 2.0));
+        float floc2 = noise3D(vec3(nuv * 35.0 - time * 0.08, seed * 3.0));
+        float flocBreak = mix(1.0, floc1 * floc2 * 4.0, flocculence);
+        arms *= clamp(flocBreak, 0.2, 1.5);
+        
+        // Fine clumpy texture - fast swirling
+        float fineNoise = noise3D(vec3(nuv * 40.0 + time * 0.05, seed * 4.0));
+        arms *= (0.5 + fineNoise * 0.6);
+        
+        // Dust lanes - animated movement
+        float dustPhase = spiralAng * numArms / 2.0 + 0.3 + hash(seed * 41.0) * 0.4;
+        dustPhase += sin(time * 0.2 + seed) * 0.15;  // Visible dust lane movement
+        float dustLane = smoothstep(0.2, 0.4, sin(dustPhase)) * smoothstep(0.6, 0.4, sin(dustPhase));
+        dustLane *= smoothstep(galaxySize * 0.65, galaxySize * 0.08, r);
+        dustLane *= (0.6 + turb * 0.5);
+        
+        // VERY SMALL central bulge - barely visible
+        float bulgeR = galaxySize * (0.02 + hash(seed * 45.0) * 0.02);  // Tiny bulge
+        float bulge = exp(-r * r / (bulgeR * bulgeR)) * 0.08;  // Nearly invisible
+        
+        // Pinpoint nucleus - extremely dim
+        float nucleusR = galaxySize * 0.004;
+        float nucleus = exp(-r * r / (nucleusR * nucleusR)) * 0.12;  // Barely there
+        
+        // HII regions scattered preferentially in arms (optimized: 8-15)
         float hii = 0.0;
-        for(float h = 0.0; h < 40.0; h++)
+        float numHII = 8.0 + hash(seed * 51.0) * 7.0;  // 8-15 HII regions
+        for(float k = 0.0; k < 15.0; k++)
         {
-            float hSeed = seed + h * 89.0;
-            float hAng = hash(hSeed) * 6.28;
-            float hR = galaxySize * (0.15 + hash(hSeed + 1.0) * 0.6);
-            vec2 hPos = vec2(cos(hAng), sin(hAng)) * hR;
-            float hDist = length(uv - hPos);
-            float hSize = galaxySize * (0.006 + hash(hSeed + 2.0) * 0.012);
-            
-            // Irregular clumpy shape
-            float hShape = smoothstep(hSize * 1.3, hSize * 0.15, hDist);
-            hShape *= (arms * 0.7 + 0.3);  // Preferentially in arms
-            hii += hShape * (0.5 + hash(hSeed + 3.0) * 0.5);
+            if(k >= numHII) break;
+            float kSeed = seed + k * 73.0;
+            float kAng = hash(kSeed) * 6.28;
+            float kR = (0.06 + hash(kSeed + 1.0) * 0.8) * galaxySize;
+            vec2 kPos = vec2(cos(kAng + rotAng), sin(kAng + rotAng)) * kR;
+            float kDist = length(uv - kPos);
+            float kSize = galaxySize * (0.0015 + hash(kSeed + 2.0) * 0.004);
+            // Sharp cutoff
+            float kBright = smoothstep(kSize, kSize * 0.08, kDist);
+            hii += kBright * hash(kSeed + 3.0) * 0.9;
         }
-        hii = min(hii, 1.0);
+        hii = min(hii, 2.0);
         
-        // ===== BLUE STAR CLUSTERS =====
-        float blueClusters = 0.0;
-        for(float c = 0.0; c < 25.0; c++)
+        // Star clusters - blue OB associations (optimized: 10-25)
+        float clusters = 0.0;
+        vec3 clusterTotalCol = vec3(0.0);
+        float numClusters = 10.0 + hash(seed * 151.0) * 15.0;  // 10-25 clusters
+        for(float k = 0.0; k < 25.0; k++)
         {
-            float cSeed = seed + c * 127.0 + 1000.0;
-            float cAng = hash(cSeed) * 6.28;
-            float cR = galaxySize * (0.2 + hash(cSeed + 1.0) * 0.55);
-            vec2 cPos = vec2(cos(cAng), sin(cAng)) * cR;
+            if(k >= numClusters) break;
+            float kSeed = seed + k * 97.0 + 500.0;
+            vec2 cPos = (hash3(vec3(kSeed)).xy - 0.5) * galaxySize * 1.9;
+            // Some clusters follow arms, some scattered
+            float followArm = hash(kSeed + 7.0);
+            if(followArm > 0.4) {
+                // Adjust position toward arms
+                float armAng = atan(cPos.y, cPos.x);
+                float armR = length(cPos);
+                armAng += sin(armR / galaxySize * spiralTightness) * 0.3;
+                cPos = vec2(cos(armAng), sin(armAng)) * armR;
+            }
             float cDist = length(uv - cPos);
-            float cSize = galaxySize * (0.003 + hash(cSeed + 2.0) * 0.006);
-            
-            float cluster = smoothstep(cSize * 1.2, cSize * 0.1, cDist);
-            cluster *= (arms * 0.6 + 0.4);
-            blueClusters += cluster * hash(cSeed + 3.0);
+            float cSize = galaxySize * (0.001 + hash(kSeed + 2.0) * 0.005);
+            // Sharp cutoff instead of smooth halo
+            float clusterBright = smoothstep(cSize, cSize * 0.08, cDist) * (arms * 0.5 + 0.3);
+            // Vary cluster colors - blue, cyan, white, pale yellow
+            float cHue = hash(kSeed + 10.0);
+            vec3 cCol;
+            if(cHue < 0.3) cCol = vec3(0.5, 0.7, 1.0);       // Blue
+            else if(cHue < 0.5) cCol = vec3(0.4, 0.85, 0.95); // Cyan
+            else if(cHue < 0.75) cCol = vec3(0.95, 0.95, 1.0); // White
+            else cCol = vec3(1.0, 0.95, 0.8);                  // Pale yellow
+            // Subtle twinkling
+            float twinkle = 0.8 + 0.2 * sin(time * (3.0 + hash(kSeed) * 8.0) + kSeed * 5.0);
+            clusterTotalCol += cCol * clusterBright * twinkle;
+            clusters += clusterBright * twinkle;
         }
-        blueClusters = min(blueClusters, 0.8);
+        clusters = min(clusters, 2.5);
         
-        // ===== CENTRAL BULGE =====
-        float bulgeSize = galaxySize * 0.12;
-        float bulge = smoothstep(bulgeSize, bulgeSize * 0.05, r);
-        bulge = bulge * bulge * bulge;  // Concentrated
+        // Individual stars (optimized: 12)
+        float indivStars = 0.0;
+        for(float k = 0.0; k < 12.0; k++)
+        {
+            float kSeed = seed + k * 31.0 + 800.0;
+            vec2 sPos = (hash3(vec3(kSeed)).xy - 0.5) * galaxySize * 1.9;
+            float sDist = length(uv - sPos);
+            float sSize = galaxySize * 0.0015;
+            indivStars += smoothstep(sSize, sSize * 0.05, sDist) * hash(kSeed + 1.0) * 0.5;
+        }
+        indivStars = min(indivStars, 0.8);
         
-        // Nucleus
-        float nucleus = smoothstep(galaxySize * 0.015, galaxySize * 0.001, r);
+        // GET UNIQUE HARMONIOUS COLOR PALETTE for this galaxy
+        vec3 palCol1, palCol2, palCol3;
+        getGalaxyPalette(seed * 61.0, palCol1, palCol2, palCol3);
         
-        // ===== COMBINE with DISCRETE STARS visible =====
-        // Stars are visible where structure is, modulated by gas
-        float armStars = arms * stars * (0.6 + gasSwirl * 0.4);
-        float barStars = bar * stars * 0.7;
-        float bulgeStars = bulge * stars * 0.5;
+        // Assign palette colors to galaxy components
+        vec3 armCol = palCol1;           // Primary color for arms
+        vec3 hiiCol = palCol2;           // Secondary color for HII regions
+        vec3 bulgeCol = palCol3 * 0.9 + vec3(0.1);  // Tertiary + slight warmth for bulge
         
-        // Gas glow (diffuse emission)
-        float gasGlow = arms * gasSwirl * 0.3;
-        gasGlow += bar * gas1 * 0.2;
+        // Derived colors
+        vec3 coreCol = mix(bulgeCol, palCol1, 0.3) + vec3(0.05, 0.03, 0.0);  // Core blends
+        vec3 starCol = mix(palCol1, vec3(1.0), 0.5);  // Stars tinted toward palette but bright
         
-        // Apply dust extinction
-        float extinction = 1.0 - dustLanes * 0.6;
-        extinction = max(extinction, 0.2);
+        // Assemble with color diversity
+        color = armCol * arms * 0.6;
+        color -= vec3(0.12, 0.06, 0.0) * dustLane * 0.6;
+        color += bulgeCol * bulge * 0.15;  // Very subtle bulge
+        color += coreCol * nucleus * 0.1;   // Barely visible nucleus
+        color += hiiCol * hii * 0.9;
+        color += clusterTotalCol * 0.7;  // Use varied cluster colors
+        color += starCol * indivStars * 0.4;
         
-        bright = (armStars + barStars + bulgeStars) * extinction + gasGlow;
-        bright += hii * 0.5 + blueClusters * 0.4 + nucleus * 0.6;
+        // Add subtle color variation across the disk using palette
+        float diskColorVar = noise3D(vec3(nuv * 3.0, seed * 5.0));
+        color += mix(palCol1, palCol2, diskColorVar) * diskColorVar * 0.08 * smoothstep(galaxySize, galaxySize * 0.2, r);
         
-        // ===== COLORS =====
-        float radialGrad = r / galaxySize;
-        vec3 innerArmCol = vec3(1.0, 0.9, 0.8);
-        vec3 outerArmCol = vec3(0.6, 0.75, 1.0);
-        vec3 armCol = mix(innerArmCol, outerArmCol, radialGrad);
+        alpha = arms * 0.4 + bulge * 0.2 + nucleus * 0.3 + hii * 0.5 + clusters * 0.3;
+    }
+    else if(gtype == 1)
+    {
+        // === BARRED SPIRAL - FAST ANIMATED ROTATION ===
+        float spinSpeed = 0.12 + hash(seed * 6.2) * 0.15;
+        float rotAng = seed * 8.0 + time * spinSpeed;
+        vec2 ruv = uv * rot2D(rotAng);
         
-        vec3 barCol = mix(vec3(1.0, 0.92, 0.8), vec3(0.95, 0.8, 0.6), abs(ruv.x) / barLen);
-        vec3 bulgeCol = mix(vec3(1.0, 0.98, 0.95), vec3(1.0, 0.85, 0.65), r / bulgeSize);
-        vec3 hiiCol = vec3(1.0, 0.35, 0.55);
-        vec3 blueCol = vec3(0.6, 0.8, 1.0);
-        vec3 dustCol = vec3(0.15, 0.08, 0.03);
+        // Random bar properties
+        float barLen = galaxySize * (0.2 + hash(seed * 51.0) * 0.25);
+        float barWidth = galaxySize * (0.04 + hash(seed * 52.0) * 0.05);
+        float barAngle = (hash(seed * 53.0) - 0.5) * 0.3;
+        // Animated bar wobble - faster
+        barAngle += sin(time * 0.25 + seed) * 0.08;
+        vec2 barUV = ruv * rot2D(barAngle);
         
-        // Gas emission color (reddish/pink nebulosity)
-        vec3 gasCol = vec3(0.9, 0.6, 0.7);
+        float bar = smoothstep(barLen, barLen * 0.5, abs(barUV.x)) * 
+                    smoothstep(barWidth, barWidth * 0.15, abs(barUV.y));
+        // Add fast animated texture to bar
+        float barNoise = noise3D(vec3(barUV * 25.0 + time * 0.1, seed));
+        bar *= (0.5 + barNoise * 0.6);
         
-        color = armCol * armStars * extinction;
-        color += barCol * barStars * extinction * 0.8;
-        color += bulgeCol * bulgeStars * 0.6;
-        color += gasCol * gasGlow * 0.5;  // Visible gas emission
-        color = mix(color, vec3(1.0, 0.98, 1.0), nucleus * 0.4);
-        color += hiiCol * hii * 1.0;
-        color += blueCol * blueClusters * 0.9;
-        color = mix(color, dustCol, dustLanes * 0.4);  // Dust darkening
+        // Random spiral properties
+        float spiralTight = 2.5 + hash(seed * 54.0) * 3.0;
+        float armWidthVar = 0.8 + hash(seed * 55.0) * 0.8;
+        
+        // Arms emerge from bar ends with randomization
+        float armAng1 = atan(barUV.y, barUV.x - barLen * 0.45);
+        float armAng2 = atan(barUV.y, barUV.x + barLen * 0.45);
+        float armR1 = length(barUV - vec2(barLen * 0.45, 0.0));
+        float armR2 = length(barUV - vec2(-barLen * 0.45, 0.0));
+        
+        // Different tightness for each arm - fast animated variation
+        float tight1 = spiralTight * (0.8 + hash(seed * 56.0) * 0.4 + sin(time * 0.2) * 0.15);
+        float tight2 = spiralTight * (0.8 + hash(seed * 57.0) * 0.4 - sin(time * 0.2) * 0.15);
+        
+        float spiral1 = sin(armAng1 - log(max(armR1 / galaxySize, 0.04)) * tight1);
+        float spiral2 = sin(armAng2 + PI - log(max(armR2 / galaxySize, 0.04)) * tight2);
+        
+        float arms = max(
+            pow(max(spiral1, 0.0), armWidthVar) * smoothstep(galaxySize * 0.95, barLen * 0.4, armR1),
+            pow(max(spiral2, 0.0), armWidthVar) * smoothstep(galaxySize * 0.95, barLen * 0.4, armR2)
+        );
+        arms *= smoothstep(galaxySize * 0.95, galaxySize * 0.2, r);
+        // Fast animated turbulence
+        arms *= (0.4 + turbulentFbm(vec3(nuv * 8.0 + time * 0.1, seed)) * 0.7);
+        
+        // Tiny nucleus - nearly invisible
+        float nucleusR = galaxySize * 0.005;
+        float nucleus = exp(-r * r / (nucleusR * nucleusR)) * 0.1;
+        
+        // Subtle bar bulge - extremely faint
+        float bulgeR = galaxySize * 0.04;
+        float bulge = exp(-r * r / (bulgeR * bulgeR)) * 0.05;
+        
+        // HII regions at bar ends and scattered in arms - NO HALO
+        float hii = 0.0;
+        vec2 barEnd1 = vec2(barLen * 0.45, 0.0);
+        vec2 barEnd2 = vec2(-barLen * 0.45, 0.0);
+        float hiiSize = galaxySize * 0.008;
+        hii += smoothstep(hiiSize, hiiSize * 0.15, length(barUV - barEnd1)) * 0.6;
+        hii += smoothstep(hiiSize, hiiSize * 0.15, length(barUV - barEnd2)) * 0.6;
+        
+        // More HII spots in arms (optimized: 8)
+        for(float k = 0.0; k < 8.0; k++)
+        {
+            float kSeed = seed + k * 67.0;
+            float kAng = hash(kSeed) * 6.28;
+            float kR = (0.2 + hash(kSeed + 1.0) * 0.5) * galaxySize;
+            vec2 kPos = vec2(cos(kAng), sin(kAng)) * kR;
+            float kDist = length(barUV - kPos);
+            float kSize = galaxySize * (0.002 + hash(kSeed + 2.0) * 0.004);
+            hii += smoothstep(kSize, kSize * 0.15, kDist) * arms * hash(kSeed + 3.0);
+        }
+        hii = min(hii, 1.5);
+        
+        // Star clusters (optimized: 8-20)
+        float clusters = 0.0;
+        vec3 clusterTotalCol = vec3(0.0);
+        float numClusters = 8.0 + hash(seed * 152.0) * 12.0;  // 8-20 clusters
+        for(float k = 0.0; k < 20.0; k++)
+        {
+            if(k >= numClusters) break;
+            float kSeed = seed + k * 89.0 + 400.0;
+            vec2 cPos = (hash3(vec3(kSeed)).xy - 0.5) * galaxySize * 1.6;
+            float cDist = length(barUV - cPos);
+            float cSize = galaxySize * (0.001 + hash(kSeed + 3.0) * 0.003);
+            float clusterBright = smoothstep(cSize, cSize * 0.1, cDist) * (bar + arms) * 0.6;
+            // Color variety
+            float cHue = hash(kSeed + 11.0);
+            vec3 cCol = cHue < 0.4 ? vec3(0.5, 0.75, 1.0) : (cHue < 0.7 ? vec3(0.6, 0.9, 0.95) : vec3(0.95, 0.95, 1.0));
+            // Twinkling
+            float twinkle = 0.85 + 0.15 * sin(time * (4.0 + hash(kSeed) * 10.0) + kSeed * 7.0);
+            clusterTotalCol += cCol * clusterBright * twinkle;
+            clusters += clusterBright * twinkle;
+        }
+        
+        // Dust lanes along bar
+        float dustLane = smoothstep(barWidth * 0.4, barWidth * 0.2, abs(ruv.y)) *
+                         smoothstep(barLen * 0.8, 0.0, abs(ruv.x)) * 0.4;
+        
+        // GET UNIQUE HARMONIOUS COLOR PALETTE for this barred spiral
+        vec3 palCol1, palCol2, palCol3;
+        getGalaxyPalette(seed * 111.0, palCol1, palCol2, palCol3);
+        
+        // Assign palette colors - bar gets warmer tint of primary
+        vec3 barCol = palCol3 * 0.8 + vec3(0.15, 0.1, 0.05);  // Warm tint
+        vec3 armCol = palCol1;           // Primary for arms
+        vec3 hiiCol = palCol2;           // Secondary for HII regions
+        vec3 coreCol = mix(barCol, palCol1, 0.2) + vec3(0.05, 0.03, 0.0);
+        
+        color = barCol * bar * 0.5;
+        color -= vec3(0.2, 0.1, 0.0) * dustLane;  // Dust lane in bar
+        color += armCol * arms * 0.6;
+        color += coreCol * nucleus * 0.15;  // Barely visible nucleus
+        color += barCol * bulge * 0.1;      // Very subtle bulge
+        color += hiiCol * hii * 0.9;
+        color += clusterTotalCol * 0.65;  // Use varied cluster colors
+        
+        alpha = bar * 0.4 + arms * 0.4 + nucleus * 0.5 + bulge * 0.2 + hii * 0.5 + clusters * 0.3;
+    }
+    else if(gtype == 2)
+    {
+        // === ELLIPTICAL GALAXY - JUST GLOBULAR CLUSTERS, NO HALO ===
+        float ellip = 0.3 + hash(seed * 26.0) * 0.65;  // More extreme ellipticity range
+        vec2 euv = uv * rot2D(seed * 4.0 + hash(seed * 127.0) * 2.0);
+        euv.y /= ellip;
+        float eR = length(euv);
+        
+        // NO profile/halo - ellipticals are ONLY their star clusters
+        
+        // MANY globular clusters - NO HALO, sharp points - GORGEOUS
+        float grain = 0.0;
+        vec3 gcTotalCol = vec3(0.0);
+        
+        // GET UNIQUE HARMONIOUS COLOR PALETTE for this elliptical
+        vec3 palCol1, palCol2, palCol3;
+        getGalaxyPalette(seed * 151.0, palCol1, palCol2, palCol3);
+        
+        float numGC = 15.0 + hash(seed * 153.0) * 15.0;  // 15-30 globular clusters
+        for(float k = 0.0; k < 30.0; k++)
+        {
+            if(k >= numGC) break;
+            vec2 gPos = (hash3(vec3(seed + k * 31.0, k * 17.0, seed)).xy - 0.5) * galaxySize * 1.3;
+            // Concentrate toward center with varied distribution
+            float concentration = 0.25 + hash(seed + k * 51.0) * 0.75;
+            gPos *= concentration;
+            float gDist = length(uv - gPos);
+            float gSize = galaxySize * (0.001 + hash(seed + k * 71.0) * 0.004);
+            // Sharp cutoff
+            float gBright = smoothstep(gSize, gSize * 0.1, gDist);
+            // Brightness falls off with distance from center
+            gBright *= exp(-length(gPos) * length(gPos) / (galaxySize * galaxySize * 0.6));
+            gBright *= (0.4 + hash(seed + k * 91.0) * 0.6);
+            // Globular cluster colors - blend between palette colors
+            float gcBlend = hash(seed + k * 111.0);
+            vec3 gcCol = gcBlend < 0.33 ? palCol1 : (gcBlend < 0.66 ? palCol2 : palCol3);
+            gcCol = mix(gcCol, vec3(1.0), 0.2);  // Brighten slightly
+            // Subtle twinkling
+            float twinkle = 0.9 + 0.1 * sin(time * (2.0 + hash(seed + k) * 6.0) + k * 3.0);
+            gcTotalCol += gcCol * gBright * twinkle;
+            grain += gBright * twinkle;
+        }
+        grain = min(grain, 3.0);
+        
+        // Individual stars (optimized: 10)
+        float stars = 0.0;
+        for(float k = 0.0; k < 10.0; k++)
+        {
+            float kSeed = seed + k * 43.0 + 300.0;
+            vec2 sPos = (hash3(vec3(kSeed)).xy - 0.5) * galaxySize * 0.9;
+            float sDist = length(uv - sPos);
+            float sSize = galaxySize * 0.001;
+            stars += smoothstep(sSize, sSize * 0.12, sDist) * exp(-length(sPos) / galaxySize) * 0.5;
+        }
+        
+        // Star color from palette
+        vec3 starCol = mix(palCol1, vec3(1.0), 0.6);
+        
+        color = gcTotalCol * 0.7;           // Globular clusters ARE the galaxy - no halo
+        color += starCol * stars * 0.4;
+        
+        alpha = grain * 0.7 + stars * 0.3;
+    }
+    else if(gtype == 3)
+    {
+        // === IRREGULAR GALAXY - FAST ANIMATED SWIRLING CHAOS ===
+        float irreg = 0.0;
+        vec3 irregCol = vec3(0.0);
+        
+        // GET UNIQUE HARMONIOUS COLOR PALETTE for this irregular
+        vec3 palCol1, palCol2, palCol3;
+        getGalaxyPalette(seed * 160.0, palCol1, palCol2, palCol3);
+        
+        // Random overall shape distortion - FAST ANIMATED
+        float shapeType = hash(seed * 160.0);
+        vec2 distortedUV = uv;
+        if(shapeType < 0.33) {
+            // Elongated with fast animated stretch
+            float stretchAmt = 0.5 + hash(seed * 161.5) * 0.5 + sin(time * 0.3) * 0.15;
+            distortedUV.x *= stretchAmt;
+        } else if(shapeType < 0.66) {
+            // Warped with fast animated swirl
+            float swirlAmt = galaxySize * (0.1 + sin(time * 0.25) * 0.05);
+            distortedUV += vec2(sin(uv.y * 15.0 + time * 0.4), cos(uv.x * 15.0 - time * 0.3)) * swirlAmt;
+        }
+        // else: compact/round
+        
+        // Variable number of clumps (optimized: 3-8)
+        float numClumps = 3.0 + hash(seed * 161.0) * 5.0;
+        for(float k = 0.0; k < 8.0; k++)
+        {
+            if(k >= numClumps) break;
+            float kSeed = seed + k * 47.0;
+            // Clump positions drift fast over time
+            vec2 clumpPos = (hash3(vec3(kSeed)).xy - 0.5) * galaxySize * (0.5 + hash(kSeed * 2.0) * 0.6);
+            clumpPos += vec2(sin(time * 0.2 + k * 1.5), cos(time * 0.18 + k * 1.3)) * galaxySize * 0.08;
+            
+            float clumpDist = length(distortedUV - clumpPos);
+            float clumpSize = galaxySize * (0.03 + hash(kSeed + 1.0) * 0.18);
+            // Fast animated size pulsing
+            clumpSize *= 0.85 + 0.15 * sin(time * 0.5 + k * 2.0);
+            
+            float sharpness = 0.5 + hash(kSeed + 5.0) * 1.5;
+            float clump = exp(-pow(clumpDist / clumpSize, sharpness));
+            // Fast animated turbulence
+            clump *= (0.5 + turbulentFbm(vec3(nuv * 8.0 + time * 0.15, seed + k)) * 0.7);
+            
+            // Each clump gets color from harmonious palette with variation
+            float clumpHue = hash(kSeed * 3.0);
+            vec3 clumpColor;
+            if(clumpHue < 0.33) {
+                clumpColor = palCol1;
+            } else if(clumpHue < 0.66) {
+                clumpColor = palCol2;
+            } else {
+                clumpColor = palCol3;
+            }
+            // Add some brightness variation
+            clumpColor *= (0.8 + hash(kSeed + 10.0) * 0.4);
+            
+            irregCol += clumpColor * clump * 1.0;
+            irreg += clump;
+        }
+        
+        // NO diffuse glow - irregulars are just clumps
+        
+        // Bright HII knots (optimized: 6)
+        float hii = 0.0;
+        vec3 hiiColor = vec3(0.0);
+        for(float k = 0.0; k < 6.0; k++)
+        {
+            float kSeed = seed + k * 83.0 + 200.0;
+            vec2 hiiPos = (hash3(vec3(kSeed)).xy - 0.5) * galaxySize * 0.65;
+            float hiiDist = length(uv - hiiPos);
+            float hiiSize = galaxySize * (0.005 + hash(kSeed) * 0.008);
+            float thisHii = smoothstep(hiiSize, hiiSize * 0.2, hiiDist);
+            hii += thisHii;
+            // HII color from palette blend
+            vec3 hc = mix(palCol2, palCol3, hash(kSeed + 5.0));
+            hc = mix(hc, vec3(1.0), 0.3);  // Brighten
+            hiiColor += hc * thisHii;
+        }
+        hii = min(hii, 2.5);
+        
+        color = irregCol;
+        color += hiiColor * 0.6;
+        
+        alpha = irreg * 0.7 + hii * 0.4;
     }
     else
     {
-        // ===== GRAND DESIGN SPIRAL (no bar) =====
-        float numArms = 2.0;
+        // === EDGE-ON SPIRAL - RANDOMIZED ===
+        vec2 euv = uv * rot2D(seed * 5.0 + hash(seed * 181.5) * 1.5);
         
-        float arms = 0.0;
-        for(float a = 0.0; a < numArms; a++)
-        {
-            float armPhase = a * 3.14159;
-            float armAng = ang - armPhase - r * armTightness / galaxySize;
-            float armWave = 0.5 + 0.5 * sin(armAng * numArms);
-            
-            float armWidth = 0.12 + gas2 * 0.08;
-            float armCore = smoothstep(0.5 - armWidth, 0.5 - armWidth * 0.3, armWave);
-            armCore *= smoothstep(0.5 + armWidth, 0.5 + armWidth * 0.3, armWave);
-            armCore *= (0.5 + gas1 * 0.5);  // Turbulent edges
-            
-            float armFade = smoothstep(galaxySize * 0.08, galaxySize * 0.15, r);
-            armFade *= smoothstep(galaxySize * 1.1, galaxySize * 0.6, r);
-            
-            arms += armCore * armFade;
-        }
-        arms = min(arms, 1.0);
+        // GET UNIQUE HARMONIOUS COLOR PALETTE for this edge-on
+        vec3 palCol1, palCol2, palCol3;
+        getGalaxyPalette(seed * 181.0, palCol1, palCol2, palCol3);
         
-        // Dust lanes
-        float dustLanes = smoothstep(0.45, 0.55, gasNoise) * arms * 0.7;
+        // Random disk properties
+        float diskThick = galaxySize * (0.025 + hash(seed * 182.0) * 0.04);  // Variable thickness
+        float diskLen = galaxySize * (0.6 + hash(seed * 183.0) * 0.35);  // Variable length
+        // Some edge-ons are slightly warped
+        float warpAmt = hash(seed * 184.0) * 0.15;
+        euv.y += sin(euv.x / galaxySize * 8.0) * warpAmt * galaxySize;
+        float disk = smoothstep(diskThick, diskThick * 0.3, abs(euv.y)) *
+                     smoothstep(diskLen, diskLen * 0.5, abs(euv.x));
+        disk *= (0.7 + noise3D(vec3(euv * 20.0, seed)) * 0.4);
         
-        // HII regions
-        float hii = 0.0;
-        for(float h = 0.0; h < 35.0; h++)
-        {
-            float hSeed = seed + h * 89.0;
-            float hAng = hash(hSeed) * 6.28;
-            float hR = galaxySize * (0.15 + hash(hSeed + 1.0) * 0.65);
-            vec2 hPos = vec2(cos(hAng), sin(hAng)) * hR;
-            float hDist = length(uv - hPos);
-            float hSize = galaxySize * (0.006 + hash(hSeed + 2.0) * 0.012);
-            float hRegion = smoothstep(hSize * 1.3, hSize * 0.1, hDist) * arms;
-            hii += hRegion * hash(hSeed + 3.0);
-        }
-        hii = min(hii, 1.0);
+        // Central bulge - peanut shaped, very subtle
+        float bulgeW = galaxySize * 0.06;
+        float bulgeH = galaxySize * 0.04;
+        float bulge = exp(-(euv.x * euv.x) / (bulgeW * bulgeW) - (euv.y * euv.y) / (bulgeH * bulgeH)) * 0.2;
         
-        // Bulge
-        float bulge = smoothstep(galaxySize * 0.12, galaxySize * 0.02, r);
-        bulge = bulge * bulge;
-        float nucleus = smoothstep(galaxySize * 0.015, galaxySize * 0.002, r);
+        // Dust lane through center
+        float dustLane = smoothstep(diskThick * 0.3, diskThick * 0.1, abs(euv.y)) *
+                         smoothstep(diskLen * 0.8, 0.0, abs(euv.x));
         
-        // Gas glow
-        float gasGlow = arms * gasSwirl * 0.3;
+        // Tiny nucleus - barely visible
+        float nucleus = exp(-length(euv) * length(euv) / (galaxySize * 0.006)) * 0.08;
         
-        // Combine with discrete stars
-        float armStars = arms * stars * (0.6 + gasSwirl * 0.4);
-        float bulgeStars = bulge * stars * 0.5;
-        float extinction = 1.0 - dustLanes * 0.6;
-        extinction = max(extinction, 0.2);
+        // Assign palette colors to edge-on components
+        vec3 diskCol = palCol1;          // Primary for disk
+        vec3 bulgeCol = palCol3 * 0.85 + vec3(0.15, 0.1, 0.05);  // Warmer for bulge
+        vec3 coreCol = mix(bulgeCol, palCol2, 0.3) + vec3(0.05, 0.03, 0.0);
         
-        bright = (armStars + bulgeStars) * extinction + gasGlow;
-        bright += hii * 0.5 + nucleus * 0.5;
+        color = diskCol * disk * 0.8;
+        color -= vec3(0.25, 0.15, 0.05) * dustLane * 0.6;  // Dark dust lane
+        color += bulgeCol * bulge * 0.2;   // Subtle bulge
+        color += coreCol * nucleus * 0.1;  // Barely visible nucleus
         
-        // Colors
-        float radialGrad = r / galaxySize;
-        vec3 armCol = mix(vec3(1.0, 0.88, 0.75), vec3(0.55, 0.7, 1.0), radialGrad);
-        vec3 bulgeCol = mix(vec3(1.0, 0.97, 0.92), vec3(1.0, 0.82, 0.6), r / (galaxySize * 0.12));
-        vec3 hiiCol = vec3(1.0, 0.38, 0.58);
-        
-        color = armCol * armStars * extinction * 1.0;
-        color += bulgeCol * bulgeStars * 0.6;
-        color = mix(color, vec3(1.0, 0.98, 1.0), nucleus * 0.35);
-        color += hiiCol * hii * 1.0;
+        alpha = disk * 0.6 + bulge * 1.0 + nucleus * 1.5;
     }
     
-    // Balanced brightness - visible but not glowing
-    color *= 1.4;
-    color = clamp(color, 0.0, 0.75);
+    // Ensure no negative colors from dust lanes
+    color = max(color, vec3(0.0));
     
-    return vec4(color, bright);
+    return vec4(color, alpha);
 }
 
-// Cosmic filament structure (large scale structure of universe)
+// Cosmic filament structure - THIN CONNECTING LINES between galaxy nodes
 float cosmicWeb(vec3 rd, float time)
 {
     float web = 0.0;
+    const float NUM_NODES = 12.0;
     
-    // Multiple scales of filaments
-    for(float scale = 1.0; scale <= 3.0; scale += 1.0)
+    for(float i = 0.0; i < NUM_NODES; i++)
     {
-        vec3 p = rd * scale * 2.0;
-        float filament = fbm(p + time * 0.01);
-        filament = pow(filament, 2.0);
-        web += filament / scale;
-    }
-    
-    return web * 0.15;
-}
-
-// Giant void regions
-float cosmicVoid(vec3 rd)
-{
-    float voids = 0.0;
-    
-    // Several void centers
-    for(float i = 0.0; i < 4.0; i++)
-    {
-        vec3 voidCenter = hash3(vec3(i * 100.0)) * 2.0 - 1.0;
-        float voidSize = 0.3 + hash(i * 50.0) * 0.4;
-        float dist = length(rd - normalize(voidCenter));
-        voids += smoothstep(voidSize, voidSize * 0.3, dist);
-    }
-    
-    return clamp(voids, 0.0, 1.0);
-}
-
-// Generate node positions for cosmic web
-vec3 getNode(float id)
-{
-    return normalize(hash3(vec3(id * 127.1, id * 311.7, id * 74.7)) * 2.0 - 1.0);
-}
-
-// Distance to a line segment
-float distToSegment(vec3 p, vec3 a, vec3 b)
-{
-    vec3 pa = p - a;
-    vec3 ba = b - a;
-    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
-    return length(pa - ba * h);
-}
-
-// Pillars of Creation style gas columns near galaxies
-vec4 renderGasPillars(vec3 rd, vec3 galaxyPos, float seed, float depthScale)
-{
-    vec3 toGalaxy = rd - galaxyPos;
-    float distToGalaxy = length(toGalaxy);
-    
-    // Only render pillars near galaxies
-    float pillarRange = 0.15 * depthScale;
-    if(distToGalaxy > pillarRange) return vec4(0.0);
-    
-    vec3 color = vec3(0.0);
-    float totalDensity = 0.0;
-    
-    // Number of pillars based on seed
-    float numPillars = 2.0 + floor(hash(seed) * 4.0);
-    
-    for(float p = 0.0; p < 6.0; p++)
-    {
-        if(p >= numPillars) break;
+        vec3 node1 = normalize(hash3(vec3(i * 127.1, i * 311.7, i * 74.7)) * 2.0 - 1.0);
         
-        // Pillar position offset from galaxy
-        float pSeed = seed + p * 137.0;
-        vec3 pillarOffset = (hash3(vec3(pSeed)) - 0.5) * 0.1 * depthScale;
-        vec3 pillarBase = galaxyPos + pillarOffset;
-        
-        // Pillar direction - mostly pointing away from galaxy center
-        vec3 pillarDir = normalize(pillarOffset + vec3(0.0, 0.0, 0.3) * (hash(pSeed + 1.0) - 0.3));
-        
-        // Pillar dimensions
-        float pillarHeight = (0.03 + hash(pSeed + 2.0) * 0.05) * depthScale;
-        float pillarWidth = (0.005 + hash(pSeed + 3.0) * 0.008) * depthScale;
-        
-        // Distance to pillar axis
-        vec3 toBase = rd - pillarBase;
-        float alongPillar = dot(toBase, pillarDir);
-        
-        // Only render along pillar length
-        if(alongPillar < 0.0 || alongPillar > pillarHeight) continue;
-        
-        vec3 closestOnAxis = pillarBase + pillarDir * alongPillar;
-        float distToAxis = length(rd - closestOnAxis);
-        
-        // Pillar tapers toward tip
-        float taper = 1.0 - alongPillar / pillarHeight;
-        float currentWidth = pillarWidth * (0.3 + taper * 0.7);
-        
-        if(distToAxis > currentWidth * 2.0) continue;
-        
-        // Density falloff
-        float density = exp(-distToAxis * distToAxis / (currentWidth * currentWidth));
-        
-        // Add some edge detail
-        float edge = 1.0 - smoothstep(currentWidth * 0.5, currentWidth, distToAxis);
-        density *= edge;
-        
-        // Color for this pillar - pick from palette
-        float colorIdx = hash(pSeed + 10.0);
-        vec3 pillarColor;
-        if(colorIdx < 0.2) pillarColor = vec3(0.6, 0.3, 0.1);      // Orange/brown
-        else if(colorIdx < 0.4) pillarColor = vec3(0.2, 0.1, 0.05); // Dark brown
-        else if(colorIdx < 0.6) pillarColor = vec3(0.4, 0.2, 0.3);  // Dusty rose
-        else if(colorIdx < 0.8) pillarColor = vec3(0.3, 0.25, 0.15);// Tan
-        else pillarColor = vec3(0.5, 0.15, 0.1);                    // Rust
-        
-        // Bright rim lighting on edges
-        float rim = smoothstep(currentWidth * 0.3, currentWidth * 0.8, distToAxis);
-        vec3 rimColor = vec3(1.0, 0.7, 0.4); // Golden rim light
-        pillarColor = mix(pillarColor, rimColor, rim * 0.5 * taper);
-        
-        // Stars forming at pillar tips
-        if(alongPillar > pillarHeight * 0.7)
+        for(float j = i + 1.0; j < min(i + 4.0, NUM_NODES); j++)
         {
-            float starGlow = (alongPillar - pillarHeight * 0.7) / (pillarHeight * 0.3);
-            starGlow = pow(starGlow, 2.0);
-            vec3 starColor = vec3(1.0, 0.9, 0.7);
-            pillarColor = mix(pillarColor, starColor, starGlow * 0.6);
+            vec3 node2 = normalize(hash3(vec3(j * 127.1, j * 311.7, j * 74.7)) * 2.0 - 1.0);
+            
+            vec3 pa = rd - node1;
+            vec3 ba = node2 - node1;
+            float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+            float dist = length(pa - ba * h);
+            
+            float filament = smoothstep(0.08, 0.01, dist);
+            float wisp = noise3D(vec3(h * 10.0 + time * 0.02, i, j)) * 0.5 + 0.5;
+            web += filament * wisp * 0.4;
         }
-        
-        color += pillarColor * density;
-        totalDensity += density;
     }
     
-    return vec4(color, totalDensity);
+    return min(web, 1.0);
 }
 
-// Galaxy cluster node with multiple galaxies at varying depths
-vec4 renderGalaxyNode(vec3 rd, vec3 nodePos, float seed, float time, float depthScale)
+// Render GORGEOUS gaseous filament with SWIRLING, SHIFTING, GLITTERING animation
+vec3 renderGasFilament(vec3 rd, vec3 p1, vec3 p2, float seed, float time)
 {
-    seed = seed + sessionSeed;
+    // Distance from ray to line segment
+    vec3 pa = rd - p1;
+    vec3 ba = p2 - p1;
+    float segLen = length(ba);
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    vec3 closest = p1 + ba * h;
+    float dist = length(rd - closest);
     
-    vec3 color = vec3(0.0);
-    float totalBright = 0.0;
+    // ANIMATED width - pulses and breathes
+    float baseWidth = 0.03 + hash(seed) * 0.02;
+    float widthPulse = 1.0 + sin(time * 0.4 + seed * 3.0) * 0.15;  // Breathing
+    float widthWave = 1.0 + sin(h * 12.0 + time * 0.8 + seed * 5.0) * 0.25;  // Wave along length
+    float width = baseWidth * widthPulse * widthWave;
     
-    // 3-6 galaxies per cluster
-    float numGalaxies = 3.0 + floor(hash(seed * 1.7) * 4.0);
+    // SWIRLING displacement - filament curves and writhes
+    float swirl1 = sin(h * 20.0 + time * 1.2 + seed) * 0.012;
+    float swirl2 = cos(h * 15.0 - time * 0.9 + seed * 2.0) * 0.01;
+    float swirl3 = sin(h * 35.0 + time * 1.8) * 0.006;  // Fine ripples
+    float swirlDist = dist + swirl1 + swirl2 + swirl3;
     
-    for(float g = 0.0; g < 6.0; g++)
+    // Moderate core with swirl
+    float coreWidth = width * 0.3;
+    float core = exp(-swirlDist * swirlDist / (coreWidth * coreWidth)) * 0.9;
+    
+    // Soft diffuse glow
+    float glow = exp(-swirlDist * swirlDist / (width * width)) * 0.5;
+    
+    // Faint outer halo
+    float haloWidth = width * 2.0;
+    float halo = exp(-swirlDist * swirlDist / (haloWidth * haloWidth)) * 0.15;
+    
+    // MOVING wispy structure - flows along filament
+    float flowSpeed = 0.3 + hash(seed * 1.5) * 0.3;  // Each filament flows differently
+    float wisp1 = noise3D(vec3(h * 15.0 + time * flowSpeed, seed * 2.0, dist * 20.0 + time * 0.2));
+    float wisp2 = noise3D(vec3(h * 25.0 - time * flowSpeed * 0.8, seed * 3.0, dist * 35.0 - time * 0.15));
+    float wisp3 = noise3D(vec3(h * 40.0 + time * flowSpeed * 1.5, seed * 4.0, dist * 50.0));  // Fast fine detail
+    float wispiness = wisp1 * 0.5 + wisp2 * 0.35 + wisp3 * 0.15;
+    
+    // Combine - bright and visible
+    float filament = core + glow * (0.5 + wispiness * 0.7) + halo;
+    
+    // Gentle end fade
+    float endFade = smoothstep(-0.15, 0.25, h) * smoothstep(1.15, 0.75, h);
+    filament *= endFade;
+    
+    // SHIFTING colors - animate through palette
+    float colorTime = time * 0.3 + seed * 2.0;
+    float colorShift = sin(colorTime) * 0.3 + cos(colorTime * 0.7) * 0.2;
+    float hueShift = sin(h * 6.0 + time * 0.5 + seed) * 0.15;  // Color varies along length
+    
+    vec3 col1 = vec3(0.3 + colorShift * 0.2 + hueShift, 0.5, 1.0);    // Blue shifting
+    vec3 col2 = vec3(0.7, 0.3 + colorShift * 0.15, 0.9 - hueShift * 0.2);   // Violet shifting
+    vec3 col3 = vec3(1.0, 0.35 + colorShift * 0.2 + hueShift * 0.1, 0.6);   // Pink shifting
+    vec3 col4 = vec3(0.4 + hueShift * 0.2, 0.8 - colorShift * 0.15, 0.9);   // Cyan shifting
+    
+    // Animated transitions along filament
+    float t1 = smoothstep(0.0, 0.35, h + sin(time * 0.4) * 0.1);
+    float t2 = smoothstep(0.25, 0.65, h + cos(time * 0.35) * 0.1);
+    float t3 = smoothstep(0.55, 0.95, h - sin(time * 0.45) * 0.1);
+    
+    vec3 filColor = mix(col1, col2, t1);
+    filColor = mix(filColor, col3, t2 * (0.5 + hash(seed + 1.0) * 0.5));
+    filColor = mix(filColor, col4, t3 * hash(seed + 2.0));
+    
+    // GLITTERING emission knots (optimized: 6)
+    float knots = 0.0;
+    vec3 knotColors = vec3(0.0);
+    for(float k = 0.0; k < 6.0; k++)
     {
-        if(g >= numGalaxies) break;
+        float kSeed = seed + k * 17.0;
+        // Knots MOVE along the filament!
+        float kBasePos = hash(kSeed);
+        float kSpeed = 0.1 + hash(kSeed + 5.0) * 0.15;
+        float kPos = fract(kBasePos + time * kSpeed);  // Moves along filament
+        float kDist = abs(h - kPos);
+        // Wrap-around distance
+        kDist = min(kDist, 1.0 - kDist);
+        float kSize = 0.04 + hash(kSeed + 23.0) * 0.04;
+        float knot = smoothstep(kSize, kSize * 0.15, kDist);
+        knot *= exp(-swirlDist * swirlDist / (width * width * 1.5));
         
-        // Scatter galaxies around node center
-        float spread = 0.08 + hash(seed + g * 13.0) * 0.12;
-        vec3 offset = (hash3(vec3(seed * 1.3 + g * 17.0, seed * 2.1 + g * 23.0, seed * 3.7 + g * 31.0)) - 0.5) * spread * depthScale;
-        vec3 galaxyPos = nodePos + offset;
+        // GLITTER - rapid brightness fluctuation
+        float glitterSpeed = 8.0 + hash(kSeed + 7.0) * 15.0;
+        float glitter = 0.6 + 0.4 * sin(time * glitterSpeed + kSeed * 10.0);
+        knot *= glitter;
         
-        // MUCH LARGER galaxy sizes in clusters
-        float sizeVar = hash(seed * 4.1 + g * 41.0);
-        float galaxySize = (0.03 + sizeVar * sizeVar * 0.08) * depthScale;
+        // Varied knot colors - some pink, some orange, some white
+        float kHue = hash(kSeed + 30.0);
+        vec3 kCol;
+        if(kHue < 0.35) kCol = vec3(1.0, 0.45, 0.55);      // Pink
+        else if(kHue < 0.6) kCol = vec3(1.0, 0.7, 0.4);   // Orange
+        else if(kHue < 0.8) kCol = vec3(0.9, 0.85, 1.0);  // Pale violet
+        else kCol = vec3(1.0, 0.95, 0.9);                  // White
         
-        float galSeed = seed * 137.0 + g * 251.0 + hash(seed + g) * 1000.0;
-        
-        vec4 gal = renderGalaxy(rd, galaxyPos, galaxySize, galSeed, time);
-        color += gal.rgb;
-        totalBright += gal.a;
+        knotColors += kCol * knot * (0.4 + hash(kSeed + 31.0) * 0.5);
+        knots += knot;
     }
+    filColor += knotColors * 0.6;
     
-    return vec4(color, totalBright);
+    // Overall brightness pulse - subtle breathing
+    float breathe = 0.9 + 0.1 * sin(time * 0.25 + seed * 4.0);
+    
+    return filColor * filament * 0.3 * breathe;  // Slightly brighter output
 }
 
-// Chaotic Hubble deep field style - galaxies, clusters, filaments only
+// Background with galaxies spread across sky - NO central blob
 vec3 cosmicWebBackground(vec3 rd, float time)
 {
-    // ========== LAYER DISTANCE/SIZE CONSTANTS ==========
-    // Adjust these to control how close/large each layer appears
+    // Very dark background
+    vec3 color = vec3(0.002, 0.001, 0.005);
     
-    // Layer 1: Very distant - tiny fuzzy blobs
-    const float LAYER1_COUNT = 80.0;
-    const float LAYER1_MIN_SIZE = 0.003;
-    const float LAYER1_MAX_SIZE = 0.008;
-    const float LAYER1_BRIGHTNESS = 0.4;
+    // Store galaxy positions for filament connections - SPREAD ALL AROUND THE SKY
+    const int NUM_MAIN_GALAXIES = 20;
+    vec3 gPositions[20];
     
-    // Layer 2: Medium distance - should start showing some shape
-    const float LAYER2_COUNT = 40.0;
-    const float LAYER2_MIN_SIZE = 0.025;
-    const float LAYER2_MAX_SIZE = 0.06;
-    const float LAYER2_BRIGHTNESS = 0.5;
+    // === GALAXIES DISTRIBUTED ALL AROUND - HIGHLY VARIED SIZES ===
+    // Front hemisphere (+Z)
+    vec3 g1Pos = normalize(vec3(-0.6, 0.5, 0.6));
+    gPositions[0] = g1Pos;
+    color += renderGalaxy(rd, g1Pos, 0.08 + hash(sessionSeed * 1.1) * 0.08, sessionSeed + 10.0, time, 0).rgb;
     
-    // Layer 3: Galaxy groups/clusters
-    const float LAYER3_COUNT = 40.0;
-    const float LAYER3_SCALE = 2.5;
-    const float LAYER3_BRIGHTNESS = 0.6;
+    vec3 g2Pos = normalize(vec3(0.7, 0.2, 0.7));
+    gPositions[1] = g2Pos;
+    color += renderGalaxy(rd, g2Pos, 0.06 + hash(sessionSeed * 1.2) * 0.09, sessionSeed + 20.0, time, 1).rgb;
     
-    // Layer 4: Prominent nearby - clearly visible structure
-    const float LAYER4_COUNT = 15.0;
-    const float LAYER4_MIN_SIZE = 1.0;
-    const float LAYER4_MAX_SIZE = 1.0;
-    const float LAYER4_BRIGHTNESS = 0.8;
+    vec3 g3Pos = normalize(vec3(0.1, -0.6, 0.75));
+    gPositions[2] = g3Pos;
+    color += renderGalaxy(rd, g3Pos, 0.09 + hash(sessionSeed * 1.3) * 0.1, sessionSeed + 30.0, time, 2).rgb;
     
-    // Layer 5: Nearfield - detailed galaxies
-    const float LAYER5_COUNT = 8.0;
-    const float LAYER5_MIN_SIZE = 1.0;
-    const float LAYER5_MAX_SIZE = 1.0;
-    const float LAYER5_BRIGHTNESS = 1.0;
+    vec3 g4Pos = normalize(vec3(0.5, 0.6, 0.55));
+    gPositions[3] = g4Pos;
+    color += renderGalaxy(rd, g4Pos, 0.05 + hash(sessionSeed * 1.4) * 0.07, sessionSeed + 40.0, time, 4).rgb;
     
-    // Dark background
-    vec3 color = vec3(0.002, 0.001, 0.004);
+    // Back hemisphere (-Z)
+    vec3 g5Pos = normalize(vec3(-0.5, 0.4, -0.7));
+    gPositions[4] = g5Pos;
+    color += renderGalaxy(rd, g5Pos, 0.07 + hash(sessionSeed * 1.5) * 0.09, sessionSeed + 50.0, time, 0).rgb;
     
-    // ========== LAYER 1: DISTANT TINY GALAXIES ==========
-    for(float i = 0.0; i < LAYER1_COUNT; i++)
+    vec3 g6Pos = normalize(vec3(0.6, -0.3, -0.65));
+    gPositions[5] = g6Pos;
+    color += renderGalaxy(rd, g6Pos, 0.06 + hash(sessionSeed * 1.6) * 0.08, sessionSeed + 60.0, time, 1).rgb;
+    
+    vec3 g7Pos = normalize(vec3(-0.3, -0.5, -0.8));
+    gPositions[6] = g7Pos;
+    color += renderGalaxy(rd, g7Pos, 0.08 + hash(sessionSeed * 1.7) * 0.1, sessionSeed + 70.0, time, 2).rgb;
+    
+    vec3 g8Pos = normalize(vec3(0.2, 0.7, -0.65));
+    gPositions[7] = g8Pos;
+    color += renderGalaxy(rd, g8Pos, 0.05 + hash(sessionSeed * 1.8) * 0.07, sessionSeed + 80.0, time, 3).rgb;
+    
+    // Left hemisphere (-X)
+    vec3 g9Pos = normalize(vec3(-0.8, 0.3, 0.2));
+    gPositions[8] = g9Pos;
+    color += renderGalaxy(rd, g9Pos, 0.07 + hash(sessionSeed * 1.9) * 0.09, sessionSeed + 90.0, time, 0).rgb;
+    
+    vec3 g10Pos = normalize(vec3(-0.75, -0.4, -0.3));
+    gPositions[9] = g10Pos;
+    color += renderGalaxy(rd, g10Pos, 0.06 + hash(sessionSeed * 2.0) * 0.08, sessionSeed + 100.0, time, 4).rgb;
+    
+    // Right hemisphere (+X)
+    vec3 g11Pos = normalize(vec3(0.85, 0.1, 0.3));
+    gPositions[10] = g11Pos;
+    color += renderGalaxy(rd, g11Pos, 0.05 + hash(sessionSeed * 2.1) * 0.07, sessionSeed + 110.0, time, 2).rgb;
+    
+    vec3 g12Pos = normalize(vec3(0.8, -0.35, -0.25));
+    gPositions[11] = g12Pos;
+    color += renderGalaxy(rd, g12Pos, 0.07 + hash(sessionSeed * 2.2) * 0.09, sessionSeed + 120.0, time, 0).rgb;
+    
+    // Top hemisphere (+Y)
+    vec3 g13Pos = normalize(vec3(0.2, 0.85, 0.3));
+    gPositions[12] = g13Pos;
+    color += renderGalaxy(rd, g13Pos, 0.06 + hash(sessionSeed * 2.3) * 0.08, sessionSeed + 130.0, time, 1).rgb;
+    
+    vec3 g14Pos = normalize(vec3(-0.25, 0.8, -0.35));
+    gPositions[13] = g14Pos;
+    color += renderGalaxy(rd, g14Pos, 0.05 + hash(sessionSeed * 2.4) * 0.07, sessionSeed + 140.0, time, 3).rgb;
+    
+    // Bottom hemisphere (-Y)
+    vec3 g15Pos = normalize(vec3(0.15, -0.85, 0.25));
+    gPositions[14] = g15Pos;
+    color += renderGalaxy(rd, g15Pos, 0.07 + hash(sessionSeed * 2.5) * 0.09, sessionSeed + 150.0, time, 0).rgb;
+    
+    vec3 g16Pos = normalize(vec3(-0.3, -0.8, -0.3));
+    gPositions[15] = g16Pos;
+    color += renderGalaxy(rd, g16Pos, 0.06 + hash(sessionSeed * 2.6) * 0.08, sessionSeed + 160.0, time, 4).rgb;
+    
+    // Interacting pairs - varied sizes
+    vec3 g17aPos = normalize(vec3(0.4, -0.45, 0.7));
+    gPositions[16] = g17aPos;
+    color += renderGalaxy(rd, g17aPos, 0.05 + hash(sessionSeed * 2.7) * 0.06, sessionSeed + 170.0, time, 0).rgb;
+    
+    vec3 g17bPos = normalize(vec3(0.48, -0.4, 0.68));
+    gPositions[17] = g17bPos;
+    color += renderGalaxy(rd, g17bPos, 0.03 + hash(sessionSeed * 2.8) * 0.04, sessionSeed + 171.0, time, 3).rgb;
+    
+    vec3 g18aPos = normalize(vec3(-0.45, 0.3, -0.75));
+    gPositions[18] = g18aPos;
+    color += renderGalaxy(rd, g18aPos, 0.05 + hash(sessionSeed * 2.9) * 0.06, sessionSeed + 180.0, time, 0).rgb;
+    
+    vec3 g18bPos = normalize(vec3(-0.38, 0.35, -0.78));
+    gPositions[19] = g18bPos;
+    color += renderGalaxy(rd, g18bPos, 0.03 + hash(sessionSeed * 3.0) * 0.04, sessionSeed + 181.0, time, 3).rgb;
+    
+    // === GASEOUS FILAMENTS connecting ALL nearby galaxies ===
+    for(int i = 0; i < 20; i++)
     {
-        float seed = sessionSeed + i * 271.0;
-        vec3 gPos = normalize(hash3(vec3(seed, seed * 1.7, seed * 2.3)) * 2.0 - 1.0);
-        float gSize = LAYER1_MIN_SIZE + hash(seed * 1.2) * (LAYER1_MAX_SIZE - LAYER1_MIN_SIZE);
-        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 100.0, time);
-        color += g.rgb * LAYER1_BRIGHTNESS;
+        for(int j = i + 1; j < 20; j++)
+        {
+            float separation = length(gPositions[i] - gPositions[j]);
+            // Connect galaxies across the whole sky
+            if(separation < 1.2 && separation > 0.08)
+            {
+                float filSeed = sessionSeed + float(i) * 100.0 + float(j) * 10.0;
+                // Moderate filaments
+                float strength = smoothstep(1.2, 0.15, separation) * 1.3 + 0.4;
+                vec3 fil = renderGasFilament(rd, gPositions[i], gPositions[j], filSeed, time);
+                color += fil * strength;
+            }
+        }
     }
     
-    // ========== LAYER 2: MEDIUM DISTANCE GALAXIES ==========
-    // These should show basic shape - spiral vs elliptical distinguishable
-    for(float i = 0.0; i < LAYER2_COUNT; i++)
+    // Tidal streams between interacting pairs
+    color += renderGasFilament(rd, g17aPos, g17bPos, sessionSeed + 500.0, time) * 3.0;
+    color += renderGasFilament(rd, g18aPos, g18bPos, sessionSeed + 501.0, time) * 3.0;
+    
+    // === DENSE GALAXY CLUSTERS - multiple regions with MANY galaxies packed together ===
+    // Each cluster has UNIQUE animation timing!
+    
+    // Cluster 1 - Rich cluster in front-right area (optimized: 8 galaxies)
+    vec3 cluster1Center = normalize(vec3(0.55, 0.25, 0.65));
+    float cluster1TimeScale = 1.4;
+    float cluster1TimeOffset = 0.0;
+    for(float i = 0.0; i < 8.0; i++)
+    {
+        float seed = sessionSeed * 3.0 + i * 73.0 + 1000.0;
+        // Galaxies clustered tightly around center
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.25;
+        // Galaxies orbit cluster center slowly
+        float orbitSpeed = 0.02 + hash(seed * 1.5) * 0.03;
+        float orbitPhase = hash(seed * 1.7) * 6.28;
+        offset.xz += vec2(cos(time * orbitSpeed + orbitPhase), sin(time * orbitSpeed + orbitPhase)) * 0.03;
+        vec3 gPos = normalize(cluster1Center + offset);
+        float gSize = 0.015 + hash(seed * 2.1) * 0.035;
+        int gType = int(hash(seed * 3.1) * 5.0);
+        // Unique time for this cluster
+        float localTime = time * cluster1TimeScale + cluster1TimeOffset + hash(seed) * 10.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 137.0, localTime, gType);
+        color += g.rgb * 0.6;
+    }
+    
+    // Cluster 2 - Dense cluster in back-left area (optimized: 6 galaxies)
+    vec3 cluster2Center = normalize(vec3(-0.6, 0.15, -0.7));
+    float cluster2TimeScale = 0.6;
+    float cluster2TimeOffset = 15.0;
+    for(float i = 0.0; i < 6.0; i++)
+    {
+        float seed = sessionSeed * 3.5 + i * 89.0 + 2000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.22;
+        // Orbital motion
+        float orbitSpeed = 0.015 + hash(seed * 1.5) * 0.02;
+        float orbitPhase = hash(seed * 1.7) * 6.28;
+        offset.xy += vec2(cos(time * orbitSpeed + orbitPhase), sin(time * orbitSpeed + orbitPhase)) * 0.025;
+        vec3 gPos = normalize(cluster2Center + offset);
+        float gSize = 0.012 + hash(seed * 2.2) * 0.03;
+        int gType = int(hash(seed * 3.2) * 5.0);
+        float localTime = time * cluster2TimeScale + cluster2TimeOffset + hash(seed) * 8.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 141.0, localTime, gType);
+        color += g.rgb * 0.55;
+    }
+    
+    // Cluster 3 - Massive cluster below (optimized: 8 galaxies)
+    vec3 cluster3Center = normalize(vec3(0.1, -0.75, 0.4));
+    for(float i = 0.0; i < 8.0; i++)
+    {
+        float seed = sessionSeed * 4.0 + i * 67.0 + 3000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.3;
+        // More chaotic orbital motion
+        float orbitSpeed = 0.01 + hash(seed * 1.5) * 0.05;  // Wide speed range
+        float orbitPhase = hash(seed * 1.7) * 6.28;
+        float orbitRadius = 0.02 + hash(seed * 1.9) * 0.04;
+        offset += vec3(cos(time * orbitSpeed + orbitPhase), sin(time * orbitSpeed * 0.7 + orbitPhase), cos(time * orbitSpeed * 1.3)) * orbitRadius;
+        vec3 gPos = normalize(cluster3Center + offset);
+        float gSize = 0.01 + hash(seed * 2.3) * 0.04;
+        int gType = int(hash(seed * 3.3) * 5.0);
+        // Each galaxy in this cluster has VERY different time scale
+        float localTimeScale = 0.5 + hash(seed * 4.1) * 1.5;
+        float localTime = time * localTimeScale + hash(seed) * 20.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 149.0, localTime, gType);
+        color += g.rgb * 0.5;
+    }
+    
+    // Cluster 4 - Compact cluster upper-left (optimized: 5 galaxies)
+    vec3 cluster4Center = normalize(vec3(-0.5, 0.7, 0.3));
+    float cluster4TimeScale = 1.1;
+    float cluster4Pulse = sin(time * 0.3) * 0.2;
+    for(float i = 0.0; i < 5.0; i++)
+    {
+        float seed = sessionSeed * 4.5 + i * 97.0 + 4000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.18;
+        // Breathing motion - galaxies move in/out from center
+        float breathPhase = hash(seed * 1.6) * 6.28;
+        offset *= 1.0 + sin(time * 0.15 + breathPhase) * 0.15;
+        vec3 gPos = normalize(cluster4Center + offset);
+        float gSize = (0.018 + hash(seed * 2.4) * 0.025) * (1.0 + cluster4Pulse);
+        int gType = int(hash(seed * 3.4) * 5.0);
+        float localTime = time * cluster4TimeScale + i * 2.0;  // Slight phase offset per galaxy
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 157.0, localTime, gType);
+        color += g.rgb * 0.6;
+    }
+    
+    // Cluster 5 - Rich cluster far right (optimized: 6 galaxies)
+    vec3 cluster5Center = normalize(vec3(0.8, -0.2, -0.4));
+    float cluster5TimeScale = -0.8;
+    float cluster5TimeOffset = 30.0;
+    for(float i = 0.0; i < 6.0; i++)
+    {
+        float seed = sessionSeed * 5.0 + i * 83.0 + 5000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.24;
+        // Counter-rotating orbital motion
+        float orbitSpeed = 0.025 + hash(seed * 1.5) * 0.025;
+        float orbitPhase = hash(seed * 1.7) * 6.28;
+        offset.yz += vec2(cos(-time * orbitSpeed + orbitPhase), sin(-time * orbitSpeed + orbitPhase)) * 0.03;
+        vec3 gPos = normalize(cluster5Center + offset);
+        float gSize = 0.013 + hash(seed * 2.5) * 0.032;
+        int gType = int(hash(seed * 3.5) * 5.0);
+        float localTime = time * cluster5TimeScale + cluster5TimeOffset + hash(seed) * 12.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 163.0, abs(localTime), gType);
+        color += g.rgb * 0.55;
+    }
+    
+    // Cluster 6 - Distant dense cluster behind (optimized: 7 galaxies)
+    vec3 cluster6Center = normalize(vec3(0.25, 0.4, -0.85));
+    float cluster6TimeScale = 0.4;
+    float cluster6TimeOffset = 50.0;
+    for(float i = 0.0; i < 7.0; i++)
+    {
+        float seed = sessionSeed * 5.5 + i * 71.0 + 6000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.28;
+        // Very subtle drift
+        float driftSpeed = 0.005 + hash(seed * 1.5) * 0.01;
+        float driftPhase = hash(seed * 1.7) * 6.28;
+        offset += vec3(sin(time * driftSpeed + driftPhase), cos(time * driftSpeed * 0.8), sin(time * driftSpeed * 1.2)) * 0.015;
+        vec3 gPos = normalize(cluster6Center + offset);
+        float gSize = 0.008 + hash(seed * 2.6) * 0.025;  // Smaller - more distant
+        int gType = int(hash(seed * 3.6) * 5.0);
+        float localTime = time * cluster6TimeScale + cluster6TimeOffset + hash(seed) * 15.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 167.0, localTime, gType);
+        color += g.rgb * 0.45;
+    }
+    
+    // === SCATTERED FIELD GALAXIES (increased: 20) ===
+    for(float i = 0.0; i < 20.0; i++)
     {
         float seed = sessionSeed * 2.0 + i * 337.0;
-        vec3 gPos = normalize(hash3(vec3(seed * 1.3, seed * 2.1, seed * 0.7)) * 2.0 - 1.0);
-        float gSize = LAYER2_MIN_SIZE + hash(seed * 2.2) * (LAYER2_MAX_SIZE - LAYER2_MIN_SIZE);
-        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 137.0, time);
-        color += g.rgb * LAYER2_BRIGHTNESS;
-    }
-    
-    // ========== LAYER 3: GALAXY GROUPS ==========
-    for(float i = 0.0; i < LAYER3_COUNT; i++)
-    {
-        float seed = sessionSeed * 3.0 + i * 457.0;
-        vec3 nodePos = normalize(hash3(vec3(seed, seed * 1.5, seed * 2.7)) * 2.0 - 1.0);
-        vec4 cluster = renderGalaxyNode(rd, nodePos, seed * 777.0, time, LAYER3_SCALE);
-        color += cluster.rgb * LAYER3_BRIGHTNESS;
-    }
-    
-    // ========== LAYER 4: PROMINENT NEARBY GALAXIES ==========
-    // Clearly visible spiral arms, bars, dust lanes
-    for(float i = 0.0; i < LAYER4_COUNT; i++)
-    {
-        float seed = sessionSeed * 4.0 + i * 523.0;
-        vec3 gPos = normalize(hash3(vec3(seed * 0.9, seed * 1.8, seed * 2.5)) * 2.0 - 1.0);
-        float gSize = LAYER4_MIN_SIZE + hash(seed * 4.2) * (LAYER4_MAX_SIZE - LAYER4_MIN_SIZE);
-        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 199.0, time);
-        color += g.rgb * LAYER4_BRIGHTNESS;
-    }
-    
-    // ========== LAYER 5: VERY NEARFIELD GALAXIES ==========
-    // These are HUGE - should dominate portions of the sky with full detail
-    for(float i = 0.0; i < LAYER5_COUNT; i++)
-    {
-        float seed = sessionSeed * 10.0 + i * 777.0;
-        // Spread them around the sky
-        float angH = hash(seed * 0.5) * 6.28;
-        float angV = (hash(seed * 1.2) - 0.5) * 1.5;
-        vec3 gPos = normalize(vec3(cos(angH), angV, sin(angH)));
-        float gSize = LAYER5_MIN_SIZE + hash(seed * 4.5) * (LAYER5_MAX_SIZE - LAYER5_MIN_SIZE);
-        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 311.0, time);
-        color += g.rgb * LAYER5_BRIGHTNESS;
-    }
-    
-    // ========== LAYER 0: ULTRA-NEARFIELD (Hubble-quality detail) ==========
-    // 2-4 MASSIVE galaxies with full structural detail like the reference image
-    const float LAYER0_COUNT = 3.0;
-    const float LAYER0_MIN_SIZE = 0.6;
-    const float LAYER0_MAX_SIZE = 1.2;
-    const float LAYER0_BRIGHTNESS = 1.2;
-    
-    for(float i = 0.0; i < LAYER0_COUNT; i++)
-    {
-        float seed = sessionSeed * 20.0 + i * 997.0;
-        // Well-spaced positions to avoid overlap
-        float angH = (i / LAYER0_COUNT) * 6.28 + hash(seed * 0.3) * 1.5;
-        float angV = (hash(seed * 1.5) - 0.5) * 1.2;
-        vec3 gPos = normalize(vec3(cos(angH), angV, sin(angH)));
-        float gSize = LAYER0_MIN_SIZE + hash(seed * 5.5) * (LAYER0_MAX_SIZE - LAYER0_MIN_SIZE);
         
-        // Use the ultra-detailed nearfield renderer
-        vec4 g = renderNearfieldGalaxy(rd, gPos, gSize, seed * 419.0, time);
-        color += g.rgb * LAYER0_BRIGHTNESS;
+        // Spread evenly around the sky
+        float angH = i * 0.15 + hash(seed) * 0.5;
+        float angV = (hash(seed * 1.5) - 0.5) * 2.8;
+        vec3 gPos = normalize(vec3(cos(angH) * cos(angV), sin(angV), sin(angH) * cos(angV)));
+        
+        // Add subtle wobble/drift to position
+        float wobbleSpeed = 0.01 + hash(seed * 1.8) * 0.02;
+        float wobblePhase = hash(seed * 1.9) * 6.28;
+        gPos = normalize(gPos + vec3(
+            sin(time * wobbleSpeed + wobblePhase) * 0.01,
+            cos(time * wobbleSpeed * 0.8 + wobblePhase) * 0.01,
+            sin(time * wobbleSpeed * 1.2 + wobblePhase * 2.0) * 0.01
+        ));
+        
+        // Small to medium sizes
+        float gSize = 0.015 + hash(seed * 2.2) * 0.04;
+        
+        // Random type
+        int gType = int(hash(seed * 3.3) * 5.0);
+        
+        // UNIQUE animation timing for each field galaxy
+        float localTimeScale = 0.6 + hash(seed * 4.4) * 1.2;  // 0.6x to 1.8x speed
+        float localTimeOffset = hash(seed * 5.5) * 50.0;  // Random phase offset
+        float localTime = time * localTimeScale + localTimeOffset;
+        
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 137.0, localTime, gType);
+        color += g.rgb * 0.45;
     }
     
-    // No foreground stars - only large scale cosmic structure
-    // No nebulae - focus on clean galaxy rendering
+    // === ADDITIONAL GALAXY CLUSTERS (6 more) ===
     
-    // No globular clusters or tiny blobs - only detailed galaxies
-    
-    // FINAL CLAMP - balanced visibility
-    color = clamp(color, 0.0, 0.85);
-    
-    return color;
-}
-
-// Get a position that's always in a hole of the Menger sponge
-vec3 getMengerHolePosition(float t)
-{
-    // The Menger sponge has holes along all three axes
-    // At any level, positions at 1/3 and 2/3 (scaled) are in holes
-    // We'll create a path that stays in the central cross-holes
-    
-    float cycle = t * 0.3;
-    float pathSelect = mod(cycle, 6.0);
-    
-    // Scale factor - how deep into the sponge
-    float depth = 0.5 + 0.4 * sin(t * 0.2);
-    
-    // Six main tunnel paths through the sponge center
-    vec3 pos;
-    
-    if(pathSelect < 1.0) {
-        // Travel along X axis through center hole
-        float p = mix(-1.2, 1.2, fract(cycle));
-        pos = vec3(p, 0.0, 0.0) * depth;
-    } else if(pathSelect < 2.0) {
-        // Transition X to Y
-        float blend = fract(cycle);
-        pos = mix(vec3(1.2, 0.0, 0.0), vec3(0.0, 1.2, 0.0), blend) * depth;
-    } else if(pathSelect < 3.0) {
-        // Travel along Y axis through center hole
-        float p = mix(1.2, -1.2, fract(cycle));
-        pos = vec3(0.0, p, 0.0) * depth;
-    } else if(pathSelect < 4.0) {
-        // Transition Y to Z
-        float blend = fract(cycle);
-        pos = mix(vec3(0.0, -1.2, 0.0), vec3(0.0, 0.0, 1.2), blend) * depth;
-    } else if(pathSelect < 5.0) {
-        // Travel along Z axis through center hole
-        float p = mix(1.2, -1.2, fract(cycle));
-        pos = vec3(0.0, 0.0, p) * depth;
-    } else {
-        // Transition Z to X
-        float blend = fract(cycle);
-        pos = mix(vec3(0.0, 0.0, -1.2), vec3(-1.2, 0.0, 0.0), blend) * depth;
+    // Cluster 7 - Upper right region
+    vec3 cluster7Center = normalize(vec3(0.7, 0.55, 0.35));
+    float cluster7TimeScale = 1.2;
+    for(float i = 0.0; i < 10.0; i++)
+    {
+        float seed = sessionSeed * 6.0 + i * 79.0 + 7000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.26;
+        float orbitSpeed = 0.02 + hash(seed * 1.5) * 0.03;
+        float orbitPhase = hash(seed * 1.7) * 6.28;
+        offset.xz += vec2(cos(time * orbitSpeed + orbitPhase), sin(time * orbitSpeed + orbitPhase)) * 0.025;
+        vec3 gPos = normalize(cluster7Center + offset);
+        float gSize = 0.012 + hash(seed * 2.1) * 0.03;
+        int gType = int(hash(seed * 3.1) * 5.0);
+        float localTime = time * cluster7TimeScale + hash(seed) * 12.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 173.0, localTime, gType);
+        color += g.rgb * 0.5;
     }
     
-    // Add small wobble that stays within hole bounds
-    float wobble = 0.08;
-    pos.x += sin(t * 1.7) * wobble * (1.0 - abs(pos.x));
-    pos.y += cos(t * 1.3) * wobble * (1.0 - abs(pos.y));
-    pos.z += sin(t * 1.1 + 1.0) * wobble * (1.0 - abs(pos.z));
+    // Cluster 8 - Lower left region
+    vec3 cluster8Center = normalize(vec3(-0.65, -0.5, 0.45));
+    float cluster8TimeScale = 0.7;
+    for(float i = 0.0; i < 8.0; i++)
+    {
+        float seed = sessionSeed * 6.5 + i * 91.0 + 8000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.22;
+        float orbitSpeed = 0.015 + hash(seed * 1.5) * 0.025;
+        float orbitPhase = hash(seed * 1.7) * 6.28;
+        offset.yz += vec2(cos(time * orbitSpeed + orbitPhase), sin(time * orbitSpeed + orbitPhase)) * 0.02;
+        vec3 gPos = normalize(cluster8Center + offset);
+        float gSize = 0.01 + hash(seed * 2.2) * 0.028;
+        int gType = int(hash(seed * 3.2) * 5.0);
+        float localTime = time * cluster8TimeScale + hash(seed) * 10.0 + 20.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 179.0, localTime, gType);
+        color += g.rgb * 0.5;
+    }
     
-    return pos;
+    // Cluster 9 - Front center-left
+    vec3 cluster9Center = normalize(vec3(-0.3, 0.1, 0.9));
+    float cluster9TimeScale = 0.9;
+    for(float i = 0.0; i < 9.0; i++)
+    {
+        float seed = sessionSeed * 7.0 + i * 103.0 + 9000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.24;
+        float orbitSpeed = 0.018 + hash(seed * 1.5) * 0.022;
+        float orbitPhase = hash(seed * 1.7) * 6.28;
+        offset.xy += vec2(cos(time * orbitSpeed + orbitPhase), sin(time * orbitSpeed + orbitPhase)) * 0.022;
+        vec3 gPos = normalize(cluster9Center + offset);
+        float gSize = 0.013 + hash(seed * 2.3) * 0.032;
+        int gType = int(hash(seed * 3.3) * 5.0);
+        float localTime = time * cluster9TimeScale + hash(seed) * 14.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 181.0, localTime, gType);
+        color += g.rgb * 0.55;
+    }
+    
+    // Cluster 10 - Deep background top
+    vec3 cluster10Center = normalize(vec3(0.15, 0.85, -0.4));
+    float cluster10TimeScale = 0.5;
+    for(float i = 0.0; i < 7.0; i++)
+    {
+        float seed = sessionSeed * 7.5 + i * 107.0 + 10000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.2;
+        float driftSpeed = 0.008 + hash(seed * 1.5) * 0.012;
+        float driftPhase = hash(seed * 1.7) * 6.28;
+        offset += vec3(sin(time * driftSpeed + driftPhase), cos(time * driftSpeed), sin(time * driftSpeed * 0.9)) * 0.012;
+        vec3 gPos = normalize(cluster10Center + offset);
+        float gSize = 0.008 + hash(seed * 2.4) * 0.022;
+        int gType = int(hash(seed * 3.4) * 5.0);
+        float localTime = time * cluster10TimeScale + hash(seed) * 18.0 + 40.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 191.0, localTime, gType);
+        color += g.rgb * 0.4;
+    }
+    
+    // Cluster 11 - Side right-back
+    vec3 cluster11Center = normalize(vec3(0.85, 0.0, -0.35));
+    float cluster11TimeScale = 1.0;
+    for(float i = 0.0; i < 8.0; i++)
+    {
+        float seed = sessionSeed * 8.0 + i * 113.0 + 11000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.23;
+        float orbitSpeed = 0.02 + hash(seed * 1.5) * 0.02;
+        float orbitPhase = hash(seed * 1.7) * 6.28;
+        offset.xz += vec2(cos(time * orbitSpeed + orbitPhase), sin(time * orbitSpeed + orbitPhase)) * 0.025;
+        vec3 gPos = normalize(cluster11Center + offset);
+        float gSize = 0.011 + hash(seed * 2.5) * 0.028;
+        int gType = int(hash(seed * 3.5) * 5.0);
+        float localTime = time * cluster11TimeScale + hash(seed) * 11.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 193.0, localTime, gType);
+        color += g.rgb * 0.5;
+    }
+    
+    // Cluster 12 - Bottom back
+    vec3 cluster12Center = normalize(vec3(-0.4, -0.6, -0.6));
+    float cluster12TimeScale = 0.65;
+    for(float i = 0.0; i < 9.0; i++)
+    {
+        float seed = sessionSeed * 8.5 + i * 119.0 + 12000.0;
+        vec3 offset = (hash3(vec3(seed)) - 0.5) * 0.25;
+        float orbitSpeed = 0.012 + hash(seed * 1.5) * 0.02;
+        float orbitPhase = hash(seed * 1.7) * 6.28;
+        offset.yz += vec2(cos(time * orbitSpeed + orbitPhase), sin(time * orbitSpeed + orbitPhase)) * 0.02;
+        vec3 gPos = normalize(cluster12Center + offset);
+        float gSize = 0.01 + hash(seed * 2.6) * 0.026;
+        int gType = int(hash(seed * 3.6) * 5.0);
+        float localTime = time * cluster12TimeScale + hash(seed) * 16.0 + 35.0;
+        vec4 g = renderGalaxy(rd, gPos, gSize, seed * 197.0, localTime, gType);
+        color += g.rgb * 0.45;
+    }
+    
+    // === BRIGHT FOREGROUND STARS (optimized: 8) ===
+    for(float s = 0.0; s < 8.0; s++)
+    {
+        float sSeed = sessionSeed + s * 97.0 + 500.0;
+        vec3 starPos = normalize(hash3(vec3(sSeed)) * 2.0 - 1.0);
+        float starDist = length(rd - starPos);
+        
+        // Sharp bright star core
+        float star = exp(-starDist * starDist / 0.00004);
+        
+        // Diffraction spikes (6-pointed like HST)
+        vec3 toStar = rd - starPos;
+        float spike1 = exp(-abs(toStar.x) / 0.0008 - starDist * 35.0);
+        float spike2 = exp(-abs(toStar.y) / 0.0008 - starDist * 35.0);
+        float spike3 = exp(-abs(toStar.x + toStar.y) / 0.0012 - starDist * 35.0);
+        float spike4 = exp(-abs(toStar.x - toStar.y) / 0.0012 - starDist * 35.0);
+        star += (spike1 + spike2 + spike3 + spike4) * 0.15;
+        
+        // Star color - MORE red and white variety
+        float starTemp = hash(sSeed + 1.0);
+        vec3 starCol;
+        if(starTemp < 0.25) starCol = vec3(1.0, 0.5, 0.3);        // Red/orange
+        else if(starTemp < 0.4) starCol = vec3(1.0, 0.7, 0.5);   // Warm orange
+        else if(starTemp < 0.7) starCol = vec3(1.0, 0.98, 0.95); // White
+        else if(starTemp < 0.85) starCol = vec3(0.9, 0.95, 1.0); // Blue-white
+        else starCol = vec3(1.0, 0.4, 0.35);                      // Deep red
+        
+        // Add flickering
+        float flicker = 0.85 + 0.15 * sin(time * (8.0 + hash(sSeed) * 12.0) + sSeed * 10.0);
+        
+        color += starCol * star * 1.3 * flicker;
+    }
+    
+    // === FLICKERING BACKGROUND DOTS (optimized: 15) ===
+    for(float s = 0.0; s < 15.0; s++)
+    {
+        float sSeed = sessionSeed + s * 53.0 + 800.0;
+        vec3 starPos = normalize(hash3(vec3(sSeed)) * 2.0 - 1.0);
+        float starDist = length(rd - starPos);
+        
+        // Tiny crisp dot - 2x smaller again
+        float star = exp(-starDist * starDist / 0.000017);
+        
+        // Color - biased toward red and white
+        float starTemp = hash(sSeed + 2.0);
+        vec3 starCol;
+        if(starTemp < 0.35) starCol = vec3(1.0, 0.45, 0.35);      // Red
+        else if(starTemp < 0.55) starCol = vec3(1.0, 0.6, 0.45);  // Orange-red
+        else if(starTemp < 0.8) starCol = vec3(1.0, 0.97, 0.93);  // White
+        else starCol = vec3(0.95, 0.95, 1.0);                      // Cool white
+        
+        // Flickering - different speeds
+        float flickerSpeed = 5.0 + hash(sSeed + 3.0) * 20.0;
+        float flicker = 0.7 + 0.3 * sin(time * flickerSpeed + sSeed * 7.0);
+        
+        color += starCol * star * 1.4 * flicker;
+    }
+    
+    // Faint background star field
+    float bgStars = stars(rd.xy * 3.0 + rd.z, sessionSeed);
+    color += vec3(0.85, 0.85, 0.9) * bgStars * 0.12;
+    
+    return clamp(color, 0.0, 1.0);
 }
 
 void main()
 {
     vec2 fragCoord = vUv * iResolution;
     
+    // ========== CONSOLE MODE - Replace entire scene with terminal ==========
+    if(iConsoleMode > 0.5)
+    {
+        vec2 screenUV = fragCoord / iResolution.xy;
+        vec3 color = renderConsole(screenUV, iTime);
+        gl_FragColor = vec4(color, 1.0);
+        return;
+    }
+    
     // Initialize session seed from JavaScript random value - truly random per page load
     sessionSeed = iRandomSeed;
     
-    // Camera orbits outside the cube to show both cube and universe
-    float angle = iTime * 0.15;
-    float angle2 = iTime * 0.1;
+    // ========== FLY-THROUGH CAMERA ==========
+    // Camera orbits around black hole at center, periodically pulls back for full view
+    // Cycle: inside (orbiting black hole) -> pull out -> full scene view -> back in
     
-    // Orbit distance varies - sometimes closer, sometimes farther to see more universe
-    float orbitCycle = sin(iTime * 0.08) * 0.5 + 0.5;
-    float orbitDist = mix(3.0, 6.0, orbitCycle);
+    float cycleTime = iTime * 0.1;  // Full cycle speed
+    float cyclePhase = mod(cycleTime, 6.283185);  // 0 to 2*PI cycle
     
-    vec3 cam_pos = vec3(
-        cos(angle) * cos(angle2 * 0.3) * orbitDist,
-        sin(angle) * cos(angle2 * 0.5) * orbitDist,
-        sin(angle2) * orbitDist * 0.6
+    // Smooth transition factor: 0 = inside near black hole, 1 = outside viewing whole scene
+    // Spends more time inside, quick pull-out and return
+    float insideOutside = smoothstep(4.5, 5.5, cyclePhase) * (1.0 - smoothstep(5.8, 6.283185, cyclePhase));
+    
+    // Inside orbit parameters - stay within central void of Menger sponge
+    // The central cavity is ~0.67 units (1/3 of size 2 cube), so keep radius < 0.3
+    float orbitSpeed = iTime * 0.3;
+    float insideRadius = 0.25;  // Safe orbit within central void
+    vec3 insidePos = vec3(
+        sin(orbitSpeed) * insideRadius,
+        sin(orbitSpeed * 0.7 + 1.0) * insideRadius * 0.3,  // Minimal vertical bob
+        cos(orbitSpeed) * insideRadius
     );
     
-    // Look towards the cube with slight offset
-    vec3 lookAt = vec3(sin(iTime * 0.05) * 0.3, cos(iTime * 0.07) * 0.3, 0.0);
-    vec3 cam_dir = normalize(lookAt - cam_pos);
+    // Outside position - pull back to see whole scene
+    float outsideRadius = 6.0;
+    vec3 outsidePos = vec3(
+        sin(orbitSpeed * 0.3) * outsideRadius,
+        cos(orbitSpeed * 0.2) * outsideRadius * 0.5 + 2.0,  // Slightly above
+        cos(orbitSpeed * 0.3) * outsideRadius
+    );
+    
+    // Blend between inside and outside positions
+    vec3 cam_pos = mix(insidePos, outsidePos, insideOutside);
+    
+    // Check if inside cube bounds (cube is size 2.0, so bounds are -2 to 2)
+    bool insideCubeBounds = abs(cam_pos.x) < 2.0 && abs(cam_pos.y) < 2.0 && abs(cam_pos.z) < 2.0;
+    
+    // Set global flag for map() function to use constant iterations when inside
+    gCameraInsideCube = insideCubeBounds;
+    
+    // Always look at the black hole (center of the cube)
+    vec3 target = vec3(0.0);
+    
+    // When outside, add slight offset to see more of the scene
+    if (insideOutside > 0.5) {
+        target = vec3(sin(iTime * 0.1) * 0.3, 0.0, cos(iTime * 0.1) * 0.3);
+    }
+    
+    vec3 cam_dir = normalize(target - cam_pos);
     
     // Camera basis vectors
-    vec3 cam_up = vec3(0.0, 0.0, 1.0);
+    vec3 cam_up = vec3(0.0, 1.0, 0.0);
+    // Add gentle roll based on orbit
+    float roll = sin(orbitSpeed * 0.3) * 0.15;
+    cam_up = vec3(sin(roll), cos(roll), 0.0);
+    
     vec3 cam_x = normalize(cross(cam_dir, cam_up));
     vec3 cam_y = cross(cam_x, cam_dir);
     
@@ -1509,17 +1975,17 @@ void main()
     vec2 uv = -1.0 + 2.0 * fragCoord / iResolution.xy;
     uv.x *= iResolution.x / iResolution.y;
     
-    // Field of view adjustment based on distance from center
-    float distFromCenter = length(cam_pos);
-    float fov = mix(1.2, 0.9, smoothstep(0.0, 2.0, distFromCenter));
+    // Wider FOV when inside cube for more immersive feel
+    float fov = insideCubeBounds ? 1.4 : 1.0;
     vec3 ray_dir = normalize(cam_dir * fov + uv.x * cam_x + uv.y * cam_y);
     
-    // Ray march
+    // Ray march the cube with STRAIGHT rays (no lensing on cube)
     vec3 c = intersect(cam_pos, ray_dir);
     
     vec3 color = vec3(0.0);
     
     if(c.x > 0.0) {
+        // HIT THE CUBE - render normally without any black hole effects
         vec3 hitPos = cam_pos + ray_dir * c.x;
         vec3 normal = calcNormal(hitPos);
         
@@ -1554,39 +2020,48 @@ void main()
         // Fresnel rim lighting for glow effect
         float fresnel = pow(1.0 - max(dot(viewDir, normal), 0.0), 3.0);
         
-        // Base color using position and time for variation
-        float colorT = length(hitPos) * 0.5 + iTime * 0.1;
-        vec3 baseColor = palette(colorT,
-            vec3(0.5, 0.5, 0.5),
-            vec3(0.5, 0.5, 0.5),
-            vec3(1.0, 1.0, 1.0),
-            vec3(0.0, 0.1, 0.2)
-        );
+        // Base color - steel blue/white to red/black palette
+        // Smoothly transition between the two color schemes based on position
+        float colorMix = sin(length(hitPos) * 2.0 + iTime * 0.15) * 0.5 + 0.5;
+        
+        // Steel blue / white palette
+        vec3 steelBlue = vec3(0.4, 0.5, 0.6);      // Steel blue
+        vec3 lightSteel = vec3(0.7, 0.8, 0.9);     // Light steel / white-ish
+        vec3 white = vec3(0.95, 0.95, 1.0);        // Cold white
+        
+        // Red / black palette
+        vec3 deepRed = vec3(0.6, 0.1, 0.1);        // Deep red
+        vec3 darkRed = vec3(0.3, 0.05, 0.05);      // Dark red
+        vec3 black = vec3(0.02, 0.02, 0.02);       // Near black
+        
+        // Position-based variation within each palette
+        float posVar = fract(dot(hitPos, vec3(1.7, 2.3, 1.9)) * 0.5);
+        
+        // Steel blue palette color
+        vec3 steelColor = mix(steelBlue, lightSteel, posVar);
+        steelColor = mix(steelColor, white, pow(posVar, 2.0) * 0.5);
+        
+        // Red/black palette color  
+        vec3 redColor = mix(darkRed, deepRed, posVar);
+        redColor = mix(redColor, black, (1.0 - posVar) * 0.6);
+        
+        // Blend between the two palettes
+        vec3 baseColor = mix(steelColor, redColor, colorMix);
         
         // Combine lighting
-        vec3 ambient = vec3(0.08, 0.06, 0.1) * ao;
+        vec3 ambient = vec3(0.05, 0.05, 0.08) * ao;
         vec3 diffuse = baseColor * (diff1 * lightCol1 * shadow1 + diff2 * lightCol2 * shadow2);
         vec3 specular = (spec1 * lightCol1 * shadow1 + spec2 * lightCol2 * shadow2) * 0.5;
         
-        // Rim glow with shifting hue
-        vec3 rimColor = palette(iTime * 0.2 + fresnel,
-            vec3(0.5, 0.5, 0.5),
-            vec3(0.5, 0.5, 0.5),
-            vec3(1.0, 0.7, 0.4),
-            vec3(0.0, 0.15, 0.2)
-        );
-        vec3 rim = fresnel * rimColor * 0.8;
+        // Rim glow - subtle steel blue or red tint
+        vec3 rimColor = mix(vec3(0.5, 0.6, 0.8), vec3(0.8, 0.2, 0.1), colorMix);
+        vec3 rim = fresnel * rimColor * 0.6;
         
         // Inner glow when close to surface
         float innerGlow = exp(-c.x * 2.0) * 0.3;
-        vec3 glowColor = palette(iTime * 0.15,
-            vec3(0.8, 0.5, 0.4),
-            vec3(0.2, 0.4, 0.2),
-            vec3(2.0, 1.0, 1.0),
-            vec3(0.0, 0.25, 0.25)
-        );
+        vec3 glowColor = mix(vec3(0.4, 0.5, 0.7), vec3(0.5, 0.1, 0.1), colorMix);
         
-        color = ambient + diffuse + specular + rim + innerGlow * glowColor;
+        color = ambient + diffuse + specular + rim + glowColor * innerGlow;
         
         // Depth fog with colored atmosphere
         float fog = 1.0 - exp(-c.x * 0.2);
@@ -1600,8 +2075,48 @@ void main()
         color += innerGlow * glowColor * 0.2;
         
     } else {
-        // Background - Cosmic web with galaxies connected by massive gas filaments
-        color = cosmicWebBackground(ray_dir, iTime);
+        // BACKGROUND - Apply gravitational lensing ONLY here
+        // Compute lensed ray direction for background
+        vec3 lensedBgDir = gravitationalLensing(cam_pos, ray_dir, BLACK_HOLE_MASS * 2.0);
+        
+        // Additional bending for rays close to black hole
+        vec3 bentPos = cam_pos;
+        for(int i = 0; i < 4; i++)
+        {
+            float distToHole = length(bentPos - BLACK_HOLE_POS);
+            if(distToHole < 2.0) {
+                float bendStrength = BLACK_HOLE_MASS * (2.0 - distToHole) * 0.5;
+                lensedBgDir = gravitationalLensing(bentPos, lensedBgDir, bendStrength);
+            }
+            bentPos = bentPos + lensedBgDir * 0.3;
+            if(length(bentPos - BLACK_HOLE_POS) < EVENT_HORIZON) break;
+        }
+        
+        // Check if ORIGINAL ray hits black hole sphere - always render as solid black
+        // This ensures black hole always appears as a black sphere
+        if(hitsEventHorizon(cam_pos, ray_dir))
+        {
+            // Solid black sphere
+            color = vec3(0.0);
+        }
+        // Also check if the lensed ray gets swallowed
+        else if(hitsEventHorizon(cam_pos, lensedBgDir))
+        {
+            // Black hole silhouette against background
+            color = vec3(0.0);
+        }
+        else
+        {
+            // Render cosmic background with lensed ray
+            color = cosmicWebBackground(lensedBgDir, iTime);
+        }
+        
+        // Add photon sphere glow and accretion disk on top (but not on black hole itself)
+        if(!hitsEventHorizon(cam_pos, ray_dir))
+        {
+            color += renderPhotonSphere(cam_pos, ray_dir);
+            color += renderAccretionDisk(cam_pos, ray_dir, iTime);
+        }
     }
     
     // Gamma correction
